@@ -1,0 +1,2810 @@
+MiniT(Mini Tomcat), 我们的目标是实现一个简单的Tomcat作为学习。包括以下功能：
+a, 接受http 请求
+b, 处理请求：
+	b1, 处理静态资源
+	b2, 处理servlet
+c, 给浏览器回复
+d, 支持多线程处理
+e, 支持多应用
+f, 支持filter
+
+
+
+---------------------------------Day 1-------------------------------------
+构建一个原始的httpserver, 用ServerSocket监听8080端口,每一个连接accept生成一个socket.
+通过socket.getInputStream()拿到浏览器过来的输入流，包装成一个Request对象，parse()解析
+然后创建一个Response，通过response输出，将静态资源如hello.txt回写到浏览器。静态资源根目录设置为webroot
+
+                socket = serverSocket.accept();
+                input = socket.getInputStream();
+                output = socket.getOutputStream();
+
+                // create Request object and parse
+                Request request = new Request(input);
+                request.parse();
+
+                // create Response object
+                Response response = new Response(output);
+                response.setRequest(request);
+                response.sendStaticResource();
+
+原始版本的request.parse()很简单，仅仅是一次性读取全部输入流到byte[] buffer，然后转换成String。
+    StringBuffer request = new StringBuffer(2048);
+    int i;
+    byte[] buffer = new byte[2048];
+    i = input.read(buffer);
+    for (int j=0; j<i; j++) {
+      request.append((char) buffer[j]);
+    }
+然后获取requestline:
+  private String parseUri(String requestString) {
+    int index1, index2;
+    index1 = requestString.indexOf(' ');
+    if (index1 != -1) {
+      index2 = requestString.indexOf(' ', index1 + 1);
+      if (index2 > index1)
+        return requestString.substring(index1 + 1, index2);
+    }
+    return null;
+  }
+也就是那输入流的两个空格中的一段，当成URI。
+这是http协议所规定的，request的第一行是 Method uri protocol,如：
+GET /hello.txt HTTP/1.1
+
+实际上，当我们在浏览器地址栏写http://localhost:8080/hello.txt的时候，发送的request字符串为：
+GET /hello.txt HTTP/1.1
+Host: localhost:8080
+Connection: keep-alive
+sec-ch-ua: "Chromium";v="104", " Not A;Brand";v="99", "Google Chrome";v="104"
+sec-ch-ua-mobile: ?0
+sec-ch-ua-platform: "Windows"
+Upgrade-Insecure-Requests: 1
+User-Agent: Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9
+Sec-Fetch-Site: none
+Sec-Fetch-Mode: navigate
+Sec-Fetch-User: ?1
+Sec-Fetch-Dest: document
+Accept-Encoding: gzip, deflate, br
+Accept-Language: en-AU,en;q=0.9,zh-CN;q=0.8,zh;q=0.7
+Cookie: ajs_anonymous_id=%22af38cecd-997d-4ebe-a773-02dd69ff8dc6%22
+
+原始版本的Response也很简单，只能输出静态资源文件，内部包含了request和outputstream:
+public class Response {
+  private static final int BUFFER_SIZE = 1024;
+  Request request;
+  OutputStream output;
+}
+通过下面的方法输出静态资源：
+  public void sendStaticResource() throws IOException {
+    byte[] bytes = new byte[BUFFER_SIZE];
+    FileInputStream fis = null;
+      File file = new File(HttpServer.WEB_ROOT, request.getUri());
+      if (file.exists()) {
+        fis = new FileInputStream(file);
+        int ch = fis.read(bytes, 0, BUFFER_SIZE);
+        while (ch!=-1) {
+          output.write(bytes, 0, ch);
+          ch = fis.read(bytes, 0, BUFFER_SIZE);
+        }
+        output.flush();
+      }
+我们看到，sendStaticResource()也是将文件中的字节读取出来，写output麻醉后flush输出到浏览器。
+如果没有找到文件，则返回404：
+        String errorMessage = "HTTP/1.1 404 File Not Found\r\n" +
+          "Content-Type: text/html\r\n" +
+          "Content-Length: 23\r\n" +
+          "\r\n" +
+          "<h1>File Not Found</h1>";
+        output.write(errorMessage.getBytes());
+
+按照http协议，response流是如下格式：
+状态行
+响应头
+空行
+响应体
+其中状态行格式为Method Code Name，如：
+HTTP/1.1 200 OK
+
+原始版本，response本身没有实现http协议，所以我们应该在静态文本文件中按照http响应格式准备文本，如：
+HTTP/1.1 200 OK
+Content-Type: text/html
+Content-Length: 12
+
+Hello World!
+
+现在就有了一个原始版本的httpserver。
+
+
+
+---------------------------------Day 2-------------------------------------
+原始版本的httpserver局限很大，只能静态资源，还不能组装response,需要静态资源本身符合http response规范。
+现在我们改写一下，由Response来完成http协议封装。
+我们看看协议怎么规定的：
+http响应 由四部分组成：状态行 ，Head ， 空行，响应体
+状态行： http协议版本  空格  状态码  空格  状态名称
+HTTP/1.1 200 OK
+
+Head：包含了对服务器的描述,对返回数据的描述.如：
+Content-Type: application/xhtml+xml;charset=utf-8 // 返回数据的类型
+Content-Length: 1528 // 返回响应体数据的长度
+Server: minit // 服务器类型
+Content-Encoding: gzip // 服务器支持的数据压缩格式
+Date: 2022-08-21T14:15:48.641+10:00[Australia/Sydney] // 响应的时间
+
+响应体:服务器返回给客户端的具体数据(html/文件/图片…)
+
+规定MiniT响应格式为：
+HTTP/1.1 ${StatusCode} ${StatusName}
+Content-Type: ${ContentType}
+Content-Length: ${ContentLength}
+Server: minit
+Date: ${ZonedDateTime}
+
+response返回时，用apache commons-lang包中的StringUtils工具进行占位符填充。
+	  /*
+	   * "HTTP/1.1 ${StatusCode} ${StatusName}\r\n"+
+		  "Content-Type: ${ContentType}\r\n"+
+		  "Content-Length: ${ContentLength}\r\n"+
+		  "Server: minit\r\n"+
+		  "Date: ${ZonedDateTime}\r\n"+
+	   */
+	  long fileLength = file.length();
+
+	  Map<String,Object> valuesMap = new HashMap<>();
+	  valuesMap.put("StatusCode","200");
+	  valuesMap.put("StatusName","OK");
+	  valuesMap.put("ContentType","text/html;charset=uft-8");
+	  valuesMap.put("ContentLength",fileLength);
+	  valuesMap.put("ZonedDateTime",DateTimeFormatter.ISO_ZONED_DATE_TIME.format(ZonedDateTime.now()));
+	  
+	  StrSubstitutor sub = new StrSubstitutor(valuesMap);
+	  String responseHead = sub.replace(OKMessage);
+	  
+	  return responseHead;
+
+接下来，接着实现servlet调用。
+先简单的以/servlet/目录开始的uri，我们认为就是要调用servlet，以后再改进为mapping的方式。
+这样，我们只要从request中getUri()后分支就可以了，用两个processor进行处理，
+静态的还是以前的做法，带servlet的，就用反射加载并调用。
+        if (request.getUri().startsWith("/servlet/")) {
+          ServletProcessor processor = new ServletProcessor();
+          processor.process(request, response);
+        }
+        else {
+          StaticResourceProcessor processor = new StaticResourceProcessor();
+          processor.process(request, response);
+        }
+
+StaticResourceProcessor简单，把以前写在Response里面的代码挪过来：
+public class StaticResourceProcessor {
+	  private static final int BUFFER_SIZE = 1024;
+	  private static String fileNotFoundMessage = "HTTP/1.1 404 File Not Found\r\n" +
+	          "Content-Type: text/html\r\n" +
+	          "Content-Length: 23\r\n" +
+	          "\r\n" +
+	          "<h1>File Not Found</h1>";
+	  private static String OKMessage = "HTTP/1.1 ${StatusCode} ${StatusName}\r\n"+
+			  "Content-Type: ${ContentType}\r\n"+
+			  "Content-Length: ${ContentLength}\r\n"+
+			  "Server: minit\r\n"+
+			  "Date: ${ZonedDateTime}\r\n"+
+			  "\r\n";
+
+	  public void process(Request request, Response response) throws IOException {
+		    byte[] bytes = new byte[BUFFER_SIZE];
+		    FileInputStream fis = null;
+		    OutputStream output = null;
+	    	output = response.getOutput();
+		      File file = new File(HttpServer.WEB_ROOT, request.getUri());
+		      if (file.exists()) {
+		      	String head = composeResponseHead(file);
+		  	    output.write(head.getBytes("utf-8"));
+		  	    
+		        fis = new FileInputStream(file);
+		        int ch = fis.read(bytes, 0, BUFFER_SIZE);
+		        while (ch!=-1) {
+		          output.write(bytes, 0, ch);
+		          ch = fis.read(bytes, 0, BUFFER_SIZE);
+		        }
+		        output.flush();
+		      }
+		      else {
+		        output.write(fileNotFoundMessage.getBytes());
+		      }
+		  }
+	  
+	  private String composeResponseHead(File file) {
+		  /*
+		   * "HTTP/1.1 ${StatusCode} ${StatusName}\r\n"+
+			  "Content-Type: ${ContentType}\r\n"+
+			  "Content-Length: ${ContentLength}\r\n"+
+			  "Server: minit\r\n"+
+			  "Date: ${ZonedDateTime}\r\n"+
+		   */
+		  long fileLength = file.length();
+
+		  Map<String,Object> valuesMap = new HashMap<>();
+		  valuesMap.put("StatusCode","200");
+		  valuesMap.put("StatusName","OK");
+		  valuesMap.put("ContentType","text/html;charset=uft-8");
+		  valuesMap.put("ContentLength",fileLength);
+		  valuesMap.put("ZonedDateTime",DateTimeFormatter.ISO_ZONED_DATE_TIME.format(ZonedDateTime.now()));
+		  
+		  StrSubstitutor sub = new StrSubstitutor(valuesMap);
+		  String responseHead = sub.replace(OKMessage);
+		  
+		  return responseHead;
+	  }
+
+}
+
+ServletProcessor应该是加载servlet并调用servlet.service().根据servlet规范，应该实现javax.servlet.Servlet,但是
+现在这个时刻，我们想简单一点，自己定义一个interface:
+public interface Servlet {
+	public void service(Request req, Response res) throws IOException;
+}
+用户程序只要实现Servlet接口，在service方法中回写Response。所以我们需要在Response中提供一个getOutput()让用户程序
+拿到输出流。
+public class Response {
+  Request request;
+  OutputStream output;
+
+  public Response(OutputStream output) {
+    this.output = output;
+  }
+  public void setRequest(Request request) {
+    this.request = request;
+  }  
+  public OutputStream getOutput() {
+	  return this.output;
+  }
+}
+现在Response已经很简单了。
+
+public class ServletProcessor {
+	  private static String OKMessage = "HTTP/1.1 ${StatusCode} ${StatusName}\r\n"+
+			  "Content-Type: ${ContentType}\r\n"+
+			  "Server: minit\r\n"+
+			  "Date: ${ZonedDateTime}\r\n"+
+			  "\r\n";
+
+	  public void process(Request request, Response response) {
+	      String uri = request.getUri();
+	      String servletName = uri.substring(uri.lastIndexOf("/") + 1);
+	      URLClassLoader loader = null;
+	      OutputStream output = null;
+
+	      // create a URLClassLoader,规定用户servlet放在web_root下。
+	      URL[] urls = new URL[1];
+	      URLStreamHandler streamHandler = null;
+	      File classPath = new File(HttpServer.WEB_ROOT);
+	      String repository = (new URL("file", null, classPath.getCanonicalPath() + File.separator)).toString() ;
+	      urls[0] = new URL(null, repository, streamHandler);
+	      loader = new URLClassLoader(urls);
+
+		  //加载servlet
+	      Class<?> servletClass = null;
+    	  servletClass = loader.loadClass(servletName);
+
+		  //写response  head
+	      output = response.getOutput();
+	      String head = composeResponseHead();
+		  output.write(head.getBytes("utf-8"));
+
+		  //调用servlet service()
+	      Servlet servlet = null;
+	      servlet = (Servlet) servletClass.newInstance();
+	      servlet.service(request, response);
+
+		  output.flush();
+	  }
+}
+
+客户程序这么写：
+package test;
+public class HelloServlet implements server.Servlet{
+	public void service(Request req, Response res) throws IOException {
+		String doc = "<!DOCTYPE html> \n" +
+	            "<html>\n" +
+	            "<head><meta charset=\"utf-8\"><title>Test</title></head>\n"+
+	            "<body bgcolor=\"#f0f0f0\">\n" +
+	            "<h1 align=\"center\">" + "Hello World 你好" + "</h1>\n";
+		
+	    res.getOutput().write(doc.getBytes("utf-8"));
+	}
+}
+从response中拿到output，回写数据。
+
+build之后，把HelloServlet.class放到 webroot/test目录下，启动 HttpServer,浏览器地址栏输入：
+http://localhost:8080/servlet/test.HelloServlet
+可以看到浏览器显示：
+Hello World 你好
+
+证明运行成功。
+
+问题是我们现在并没有遵守servlet规范，下面再改进。
+
+
+
+----------------------------------Day 3----------------------------
+现在我们引入servlet规范。servlet api在javax中，需要单独引入：
+	  <dependency>
+	    <groupId>javax.servlet</groupId>
+	    <artifactId>javax.servlet-api</artifactId>
+	    <version>4.0.1</version>
+	    <scope>provided</scope>
+	  </dependency>
+按照servlet规范，一个servlet应该实现接口：
+public interface Servlet {
+    public void init(ServletConfig config) throws ServletException;
+    public void service(ServletRequest req, ServletResponse res) throws ServletException, IOException;
+    public ServletConfig getServletConfig();
+    public String getServletInfo();
+    public void destroy();
+}
+因此我们要拿掉上次自己写的Servlet接口，改用javax.servlet.Servlet。
+马上面临一个问题，request和response需要调整，也要实现ServletRequest和ServletResponse接口。
+ServletRequest接口里面有相当多的方法，我们暂时留空。
+一样地，ServletResponse接口里面有相当多的方法，我们留空,除了一个：PrintWriter getWriter() throws IOException;
+我们需要提供一个writer给用户程序员使用，往outputstream中写入string，以前直接用的output是byte[]，不太便利。
+public PrintWriter getWriter() throws IOException {
+    // autoflush is true, println() will flush,
+    // but print() will not.
+    writer = new PrintWriter(new OutputStreamWriter(output,getCharacterEncoding()), true);
+    return writer;
+}
+这给outputstream指定了一个编码，一般用"UTF-8", response里面有一个方法：
+public void setCharacterEncoding(String arg0) {
+	this.characterEncoding = arg0;
+}
+
+所以调用 getWriter之前，一定要先调用response.setCharacterEncoding("UTF-8")
+
+
+客户程序servlet直接改成：
+	public void service(ServletRequest req, ServletResponse res) throws ServletException, IOException {
+		res.setCharacterEncoding("UTF-8");
+		String doc = "<!DOCTYPE html> \n" +
+	            "<html>\n" +
+	            "<head><meta charset=\"utf-8\"><title>Test</title></head>\n"+
+	            "<body bgcolor=\"#f0f0f0\">\n" +
+	            "<h1 align=\"center\">" + "Hello World 你好" + "</h1>\n";
+		
+	    res.getWriter().println(doc);
+	}
+	
+相应地 ServletProcessor里面也都改成writer.
+
+
+
+---------------------------Day 4-------------------------------------
+现在我们的Minit有了基本的servlet container功能，能够接收客户端请求，调用servlet，响应客户端。
+我们能够看到，这个服务器有两部分功能，一个是处理请求和响应，用于连接服务器与客户端，一个是处理servlet，
+由于有多个servlet，需要管理器container.
+按照这个思路，我们可以进一步分解，把server分成明显的两部分各司其职:connector和processor.
+
+将HttpConnector实现为一个线程，将HttpServer中await() 程序挪到HttpConnector中.
+
+HttpServer就很简单了，仅仅是启动这个connector:
+        HttpConnector connector = new HttpConnector();
+        connector.start();
+
+为了提升Connector性能，能够响应大量客户端请求。进一步将创建request和response的工作放到processor中。
+public class HttpProcessor {
+	public void process(Socket socket) {
+        InputStream input = null;
+        OutputStream output = null;
+        
+        ... ...
+            // check if this is a request for a servlet or a static resource
+            // a request for a servlet begins with "/servlet/"
+            if (request.getUri().startsWith("/servlet/")) {
+              ServletProcessor processor = new ServletProcessor();
+              processor.process(request, response);
+            }
+            else {
+              StaticResourceProcessor processor = new StaticResourceProcessor();
+              processor.process(request, response);
+            }
+}
+processor不再关闭socket，交由connector负责。
+
+Connector仅仅将socket分配给processor，做的工作尽量少，这样性能高。
+        while (true) {
+            Socket socket = null;
+            socket = serverSocket.accept();
+            HttpProcessor processor = new HttpProcessor();
+            processor.process(socket);
+            socket.close();
+        }
+
+
+---------------------------Day 5---------------------------------------
+以前我们接收到一个请求后，每次新建一个processor:
+                  ServletProcessor processor = new ServletProcessor();
+                  processor.process(request, response);
+需要改进，改进的思路是池。我们把processor放到一个池中，不是每次创建之后就丢弃。
+
+Connector里面的代码改成如下的样子：
+			// Hand this socket off to an appropriate processor
+            HttpProcessor processor = createProcessor();
+            if (processor == null) {
+                socket.close();
+                continue;
+            }
+            processor.process(socket);
+可以看出，分成三步：
+获取processor；
+如果获取不到processor，关闭socket，直接返回；
+如果获取到processor，将socket交由processor处理。
+
+核心就在createProcessor()中，改成了在池中获取：
+    /**
+     * Create (or allocate) and return an available processor for use in
+     * processing a specific HTTP request, if possible.  If the maximum
+     * allowed processors have already been created and are in use, return
+     * <code>null</code> instead.
+     */
+
+我们用一个ArrayDeque存放这些Processor:
+	int minProcessors = 3;
+	int maxProcessors = 10;
+	int curProcessors = 0;
+	Deque<HttpProcessor> processors = new ArrayDeque<>();
+
+Connector处理程序改成：
+                // Hand this socket off to an appropriate processor
+                HttpProcessor processor = createProcessor();
+                if (processor == null) {
+                    socket.close();
+                    continue;
+                }
+                processor.process(socket);
+                processors.push(processor);
+每次从池中获取一个processor，任务执行完之后再把它放回池中。
+
+目前为止，processor有多个了，但是并没有多线程，只是再池中放置了多个对象，也没有NIO，是阻塞式的运行。socket每次用之后也关闭丢弃了。
+
+
+------------------------------------Day 6-----------------------------------------
+下面我们进一步，把processor异步化，使得一个connector可以同时服务多个processor.
+我们先让HttpProcessor实现 Runnable，这样每个processor会在自己独立的线程中运行。
+public void run() {
+    while (true) {
+        // Wait for the next socket to be assigned
+        Socket socket = await();
+
+        if (socket == null) continue;
+
+        // Process the request from this socket
+        process(socket);
+
+        // Finish up this request
+        connector.recycle(this);
+    }
+}
+过程就是：等待一个socket，处理，完毕之后就回收到池中。
+
+我们提供一个assign(socket)让connector分配socket给processor,还提供一个await()让processor等待socket.
+这是两个线程，需要同步，我们用一个标志available来标记。
+
+processor的等待过程，启动processor线程后，available标志为false，就一直等。
+而有了socket之后，connector会调用assign(socket)，那个时候，就会把标志改成true，
+然后调用notifyAll()唤醒等待的线程。
+也就是说，一旦connector分配一个socket给processor，processor就能结束等待，拿到socket
+继续后面的工作。
+processor一旦拿到socket，又会立刻把标志设回到false，并NotifyAll()唤醒connector等待线程，
+这样connector就可以抽身为别的processor分配另一个socket了。
+	private synchronized Socket await() {
+	    // Wait for the Connector to provide a new Socket
+	    while (!available) { 
+	    	try {
+	    		wait();
+	    	}catch (InterruptedException e) { 
+	    	} 
+	    }
+	    // Notify the Connector that we have received this Socket
+	    Socket socket = this.socket;
+	    available = false;
+	    notifyAll();
+
+	    return (socket);
+	}
+	synchronized void assign(Socket socket) {
+		// Wait for the processor to get the previous socket
+	    while(available) {
+	        try {
+	            wait();
+	        }catch (InterruptedException e) { }
+	    }
+	    // Store the newly available Socket and notify our thread
+	    this.socket = socket;
+	    available = true;
+	    notifyAll();
+	}
+
+由于connector和processor式异步模式了，所以不能在connector中close socket，要放在processor的process()中。	
+
+--------------------------Day 7-------------------------------------------
+上面我们用的wait()-notify()实现了多线程协调，再用ThreadPoolExecutor()实现一下。
+
+我们在connector中声明一个executor service:
+	ExecutorService executor = Executors.newFixedThreadPool(threadpoolsize);
+
+ExecutorService简化了多线程的编写，直接提交一个任务即可。
+                HttpProcessor processor = createProcessor();
+                processor.assign(socket);
+                executor.execute(processor);
+
+而任务的实现，也简化了，不用wait()和notify()：
+	public void run() {
+	        Socket socket = this.socket;
+	        process(socket);
+	        connector.recycle(this);
+	}
+	synchronized void assign(Socket socket) {
+	    this.socket = socket;
+	}	
+
+
+因为Tomcat4版本是用的wait()-notify()，所以我们之后也用这个。
+
+
+
+-------------------------Day 8---------------------------------------
+servlet规范中，对request和response提供了http协议的接口规定，这就是javax.servlet.http.HttpServletRequest
+和javax.servlet.http.HttpServletResponse.
+我们现在就来实现，并进行进一步的解析工作，拿到head, cookie和参数等等信息。
+
+public class HttpRequest implements HttpServletRequest{}
+public class HttpResponse implements HttpServletResponse{}
+接口里面规定了一大堆方法，我们一点一点实现。先把以前Request里面的几个方法搬过来：
+public class HttpRequest implements HttpServletRequest{
+  private InputStream input;
+  private String uri;
+
+  public Request(InputStream input) {
+    this.input = input;
+  }
+  public void parse() {}
+  private String parseUri(String requestString) {}
+  public String getUri() {}
+}
+
+从request中，我们希望servlet可以方便地拿出header信息和parameter信息，即接口中规定的几个方法：
+getHeader, getHeaderNames, getHeaders, getParameter, getPrameterMap, getParameterNames, getParameterValues.
+
+
+所以我们用下面的数据结构保存这些信息：
+	  protected HashMap<String,String> headers = new HashMap<>();
+	  protected Map<String,String> parameters = new ConcurrentHashMap<>();
+headers用来存储request头信息，parameters用来存储参数。为什么用ConcurrentHashMap?是考虑我们后面
+允许servlet给request的参数进行增加删除修改操作，并发操作控制。
+
+解析有个时机问题，如果在connector中预先全部解析出来，程序简单，但是性能不高，因为servlet可能并不用这些属性，
+一种优化方案就是在servlet实际读取request属性的时候才解析。
+
+所以，我们对于头信息，在一开始就解析出来，但是对于参数信息，servlet使用的时候才解析。
+
+好，现在可以动手了。解析request，我们以前用的InputStream，一个字节一个字节读取，这样不便利，我们准备一个工具
+SocketInputStream，可以直接读一行，获取request line和headers.
+public void readRequestLine(HttpRequestLine requestLine)
+public void readHeader(HttpHeader header)
+对于request line, 我们用一个HttpRequestLine来代表，里面包含method, uri 和protocol。
+对于header，我们用HttpHeader 来代表，里面包含name和value。
+
+以前我们也有实现readRequestLine的功能，是将inputstream 全部读取，转成一个String，然后用两个空格来获取request line
+中的method, uri和protocol信息。现在，借鉴Tomcat的实现，给一个更加专业效率更好的实现：
+    protected void fill() throws IOException {
+        pos = 0;
+        count = 0;
+        int nRead = is.read(buf, 0, buf.length);
+        if (nRead > 0) {
+            count = nRead;
+        }
+    }
+fill()从inputstream中读取length长的byte，放到buf byte[]中。
+程序每次读的时候，从buf中拿到当前byte(如果拿完了，就再次fill)。	
+    public int read() throws IOException {
+        if (pos >= count) {
+            fill();
+            if (pos >= count)
+                return -1;
+        }
+        return buf[pos++] & 0xff;
+    }
+read返回-1表示出错，所以对buf这个bute[]中的字节要转成无符号int(0-255)，这是通过&0xff来实现的。
+
+    public void readRequestLine(HttpRequestLine requestLine) throws IOException {
+        // Checking for a blank line, Skipping CR or LF
+        // Reading the method name
+        // Reading URI
+        // Reading protocol
+    }
+新的readRequestLine()从输入流读到request line.
+
+有了上面的工具，request里面获取request line就很容易了：
+public class HttpRequest implements HttpServletRequest{
+	private InputStream input;
+	private SocketInputStream sis;
+	private String uri;
+	HttpRequestLine requestLine = new HttpRequestLine();
+	  
+	public HttpRequest(InputStream input) {
+	    this.input = input;
+	    this.sis = new SocketInputStream(this.input,2048);
+	}	
+	public void parse() {
+		this.sis.readRequestLine(requestLine);
+		this.uri = new String(requestLine.uri);
+	}
+	public String getUri() {
+	    return this.uri;
+	}
+}
+
+Processor里面创建Request的时候改用HttpRequest：
+            // create Request object and parse
+            HttpRequest request = new HttpRequest(input);
+            request.parse();
+
+同样，解析header。
+ScoketInputStream中提供readHeader(HttpHeader header)将一个头信息读入到header中。
+
+我们先假定我们支持如下头信息：
+public class DefaultHeaders {
+    static final String HOST_NAME = "host";
+    static final String CONNECTION_NAME = "connection";
+    static final String ACCEPT_LANGUAGE_NAME = "accept-language";
+    static final String CONTENT_LENGTH_NAME = "content-length";
+    static final String CONTENT_TYPE_NAME = "content-type";
+    static final String TRANSFER_ENCODING_NAME = "transfer-encoding";
+}
+
+request中解析headers：
+	        while (true) {
+	            HttpHeader header = new HttpHeader();
+
+	            // Read the next header
+	            sis.readHeader(header);
+	            if (header.nameEnd == 0) {
+	                if (header.valueEnd == 0) {
+	                    return;
+	                } else {
+	                    throw new ServletException("httpProcessor.parseHeaders.colon");
+	                }
+	            }
+
+	            String name = new String(header.name,0,header.nameEnd);
+	            String value = new String(header.value, 0, header.valueEnd);
+
+	            // Set the corresponding request headers
+	            if (name.equals(DefaultHeaders.ACCEPT_LANGUAGE_NAME)) {
+	                headers.put(name, value);
+	            } else if (header.equals(DefaultHeaders.CONTENT_LENGTH_NAME)) {
+	                headers.put(name, value);
+	            } else if (header.equals(DefaultHeaders.CONTENT_TYPE_NAME)) {
+	                headers.put(name, value);
+	            } else if (header.equals(DefaultHeaders.HOST_NAME)) {
+	                headers.put(name, value);
+	            } else if (header.equals(DefaultHeaders.CONNECTION_NAME)) {
+	                headers.put(name, value);
+	            } else if (header.equals(DefaultHeaders.TRANSFER_ENCODING_NAME)) {
+	                headers.put(name, value);
+	            } else {
+	                headers.put(name, value);
+	            }
+	        }
+读所有头信息，写入到一个map后，以备后用。
+
+parse()现在解析connection, requestline和headers了：
+	public void parse(Socket socket) {
+		try {
+			parseConnection(socket);
+			this.sis.readRequestLine(requestLine);
+            parseHeaders();
+		} catch (IOException e) {
+			e.printStackTrace();
+		} catch (ServletException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
+		this.uri = new String(requestLine.uri);
+	}
+
+
+
+-----------------------------Day 9--------------------------------------
+我们改了Request，接下来改Response,让它实现HttpServletResponse接口。
+先把以前卸载Response里的代码移过来：
+	HttpRequest request;
+	OutputStream output;
+	PrintWriter writer;
+	  
+	String contentType = null;
+	long contentLength = -1;
+	String charset = null;
+	String characterEncoding = null;
+	String protocol = "HTTP/1.1";
+
+	public HttpResponse(OutputStream output) {
+	    this.output = output;
+	}
+
+	public void setRequest(HttpRequest request) {
+	    this.request = request;
+	}
+		  
+	public OutputStream getOutput() {
+		return this.output;
+	}
+	public void setCharacterEncoding(String arg0) {
+		this.characterEncoding = arg0;
+	}
+	public PrintWriter getWriter() throws IOException {
+	    // autoflush is true, println() will flush,
+	    // but print() will not.
+	    writer = new PrintWriter(new OutputStreamWriter(output,getCharacterEncoding()), true);
+	    return writer;
+	}
+servlet返回响应的时候，可以先设置encoding=UTF-8，这样处理中文。
+
+我们以前提到过，按照http协议，response流是如下格式：
+状态行
+响应头
+空行
+响应体
+
+状态行，我们先选择性用如下状态：
+	protected String getStatusMessage(int status) {
+	    switch (status) {
+	      case SC_OK:
+	        return ("OK");
+	      case SC_ACCEPTED:
+	        return ("Accepted");
+	      case SC_BAD_GATEWAY:
+	        return ("Bad Gateway");
+	      case SC_BAD_REQUEST:
+	        return ("Bad Request");
+	      case SC_CONTINUE:
+	        return ("Continue");
+	      case SC_FORBIDDEN:
+	        return ("Forbidden");
+	      case SC_INTERNAL_SERVER_ERROR:
+	        return ("Internal Server Error");
+	      case SC_METHOD_NOT_ALLOWED:
+	        return ("Method Not Allowed");
+	      case SC_NOT_FOUND:
+	        return ("Not Found");
+	      case SC_NOT_IMPLEMENTED:
+	        return ("Not Implemented");
+	      case SC_REQUEST_URI_TOO_LONG:
+	        return ("Request URI Too Long");
+	      case SC_SERVICE_UNAVAILABLE:
+	        return ("Service Unavailable");
+	      case SC_UNAUTHORIZED:
+	        return ("Unauthorized");
+	      default:
+	        return ("HTTP Response Status " + status);
+	    }
+	  }
+主要就是200，500，404等几个常见的。
+
+我们要为header提供方法，addHeader()
+头信息存储在Map<String,String> headers = new ConcurrentHashMap<>();
+	public void addHeader(String name, String value) {
+		headers.put(name, value);
+		if (name.toLowerCase()==DefaultHeaders.CONTENT_LENGTH_NAME) { //"content-length"
+			setContentLength(Integer.parseInt(value));
+		}
+		if (name.toLowerCase()==DefaultHeaders.CONTENT_TYPE_NAME) {//"content-type"
+			setContentType(value);
+		}
+	}
+要注意的是如果header是content-length或者content-type，则还要设置相关属性。
+
+有了这些头信息之后，提供一个输出头信息的方法：
+	  protected void sendHeaders() throws IOException {
+	    PrintWriter outputWriter = getWriter();
+	    
+	    // Send the "Status:" header
+	    outputWriter.print(this.getProtocol());
+	    outputWriter.print(" ");
+	    outputWriter.print(status);
+	    if (message != null) {
+	      outputWriter.print(" ");
+	      outputWriter.print(message);
+	    }
+	    outputWriter.print("\r\n");
+	    
+	    // Send the content-length and content-type headers (if any)
+	    if (getContentType() != null) {
+	      outputWriter.print("Content-Type: " + getContentType() + "\r\n");
+	    }
+	    if (getContentLength() >= 0) {
+	      outputWriter.print("Content-Length: " + getContentLength() + "\r\n");
+	    }
+	    
+	    // Send all specified headers (if any)
+	      Iterator<String> names = headers.keySet().iterator();
+	      while (names.hasNext()) {
+	          String name = names.next();
+	          String value = headers.get(name);
+	          outputWriter.print(name);
+	          outputWriter.print(": ");
+	          outputWriter.print(value);
+	          outputWriter.print("\r\n");
+	      }
+
+	      // Send a terminating blank line to mark the end of the headers
+	    outputWriter.print("\r\n");
+	    outputWriter.flush();
+	  }
+就是按照http协议拼串,包含状态行，头信息和空行
+
+processor process的时候，用的是httprequest, httpresponse.
+            // create Request object and parse
+            HttpRequest request = new HttpRequest(input);
+            request.parse(socket);            
+
+            // create Response object
+            HttpResponse response = new HttpResponse(output);
+            response.setRequest(request);
+
+            // check if this is a request for a servlet or a static resource
+            // a request for a servlet begins with "/servlet/"
+            if (request.getUri().startsWith("/servlet/")) {
+              ServletProcessor processor = new ServletProcessor();
+              processor.process(request, response);
+            }
+            else {
+              StaticResourceProcessor processor = new StaticResourceProcessor();
+              processor.process(request, response);
+            }
+
+
+--------------------------Day 10------------------------------------
+我们已经在processor里面用到了httprequest和httpresponse. 这两个对象是要传到用户的servlet
+中的。但是我们看到，request和response中我们加了一些别的方法，这是内部用的。如果用户servlet
+知道我们的实现类，就可以用(HttpRequest)req进行cast，于是可以调用我们的那些内部使用的方法。
+这是我们不愿意看到的，这些内部的方法应当是不暴露给用户的。
+
+Facade模式可以解决这个问题，我们用一个Facade包裹住request和response。
+public class HttpRequestFacade implements HttpServletRequest {
+    private HttpServletRequest request;
+    public HttpRequestFacade(HttpRequest request) {
+        this.request = request;
+    }
+}
+按照HttpServletRequest接口协议，需要对外的方法就直接转而调用内部包裹住的request的相应接口。
+
+同理，我们也提供一个HttpResponseFacade。
+
+在具体的ServletProcessor中，	调用servlet.service(request, response)的时候，将Facade传递进去。
+
+
+按照规范，客户servlet是extends HttpServlet，所以service()的行为是根据MEthod判断调用那个方法，如果是GET,
+怎调用doGet(). 所以，在我们的HttpRequest中，一定要实现getMethod()这个方法：
+	public String getMethod() {
+		return new String(this.requestLine.method,0,this.requestLine.methodEnd);
+	}
+
+这样简化客户程序，他们只要override doPost() doGet()即可。
+
+
+-------------------------------------------------------------------
+我们接着解析request，以前只解析了request line(method uri protocol)，
+实际使用中uri后面还会加上query string,里面包含了parameter，比如：
+GET /app1/servlet1?username=Tommy&docid=TS0001 HTTP/1.1
+我们现在就把query string解析出来。
+
+在request的parse()中，我们已经通过this.sis.readRequestLine(requestLine)拿到了request line,
+只是当时这么拿到的uri：
+this.uri = new String(requestLine.uri,0,requestLine.uriEnd);
+考虑有query string的情况，这一行改写如下：
+		// Parse any query parameters out of the request URI      
+		int question = requestLine.indexOf("?");
+	    if (question >= 0) {
+	        queryString=new String(requestLine.uri, question + 1, requestLine.uriEnd - question - 1);
+	        uri = new String(requestLine.uri, 0, question);
+	    } else {
+	        queryString = null;
+	        uri = new String(requestLine.uri, 0, requestLine.uriEnd);
+	    }
+
+我们知道，http可以通过POST方法发送请求，这种情况下，参数是通过请求体发送的。我们还需要进一步解析请求体中的参数。
+一个POST发送的格式示例：
+POST /test HTTP/1.1
+Host: www.test.com
+User-Agent: Mozilla/5.0(Windows; U; Windows NT 5.1; en-US; rv:1.7.6)Gecko/20050225 Firefox/1.0.1
+Content-Type:application/x-www-form-urlencoded
+Content-Length: 40
+Connection: Keep-Alive
+
+name=Professional%20Ajax&publisher=Wiley
+我们看到，这种文本的情况下，其实与GET类似，只不过参数放到请求体中的，而且经过了urlencoded.
+
+我们用一个结构存储parameters：
+	Map<String,String[]> parameters = new ConcurrentHashMap<>();
+注意不是<String,String>，而是<String,String[]>，因为有些类型参数，其值是多值的，如options,checkbox
+
+
+POST方法与GET方法不同，它可以用文本方式也可以用二进制方式发送信息，这个由头信息的Content-Type声明，我们现在只管文本类型。
+还有POST可以混合，即multipart/form-data，多部分，有的是文本有的是二进制比如图片什么的。我们现在也不管。
+
+对querystring，我们先将String转成byte[]，统一进行parsePArameters(Map<String,String[]> map, byte[] data, String encoding)
+对于POST，通过SocketInputStream中读取请求体：
+	        int max = getContentLength();
+	        int len = 0;
+	        byte buf[] = new byte[getContentLength()];
+	        ServletInputStream is = getInputStream();
+	        while (len < max) {
+	          int next = is.read(buf, len, max - len);
+	          if (next < 0 ) {
+	            break;
+	          }
+	          len += next;
+	        }
+	        is.close();
+一次性将socketinputstream中的字节流读入到buf[]中，统一进行parsePArameters(Map<String,String[]> map, byte[] data, String encoding)。
+
+之后就进行参数解析：
+	public void parseParameters(Map<String,String[]> map, byte[] data, String encoding)
+	        throws UnsupportedEncodingException {
+		if (parsed) 
+			return;
+	    if (data != null && data.length > 0) {
+            int    pos = 0;
+            int    ix = 0;
+            int    ox = 0;
+            String key = null;
+            String value = null;
+            while (ix < data.length) {
+                byte c = data[ix++];
+                switch ((char) c) {
+                case '&':
+                    value = new String(data, 0, ox, encoding);
+                    if (key != null) {
+                    	putMapEntry(map,key, value);
+                        key = null;
+                    }
+                    ox = 0;
+                    break;
+                case '=':
+                    key = new String(data, 0, ox, encoding);
+                    ox = 0;
+                    break;
+                case '+':
+                    data[ox++] = (byte)' ';
+                    break;
+                case '%':
+                    data[ox++] = (byte)((convertHexDigit(data[ix++]) << 4)
+                                    + convertHexDigit(data[ix++]));
+                    break;
+                default:
+                    data[ox++] = c;
+                }
+            }
+            //The last value does not end in '&'.  So save it now.
+            if (key != null) {
+                value = new String(data, 0, ox, encoding);
+                putMapEntry(map,key, value);
+            }
+	    }
+	    parsed = true;
+	}
+
+也就是一个byte一个byte读，判断特殊字符如 &=+
+对于%20这样的要特殊处理，这是经过urlencoded的，我们要用十六进制还原它的字符。
+先拿到这个2字符，变成数字2，再拿到0字符，变成数字0
+    private byte convertHexDigit( byte b ) {
+        if ((b >= '0') && (b <= '9')) return (byte)(b - '0');
+        if ((b >= 'a') && (b <= 'f')) return (byte)(b - 'a' + 10);
+        if ((b >= 'A') && (b <= 'F')) return (byte)(b - 'A' + 10);
+        return 0;
+    }
+然后2*16+0=32，再按照ascii变成字符，即空格。
+(byte)((convertHexDigit(data[ix++]) << 4) + convertHexDigit(data[ix++]));
+
+
+最后来实现getParameter相关的几个方法。
+	public String getParameter(String name) {
+	    parseParameters();
+	    String values[] = (String[]) parameters.get(name);
+	    if (values != null)
+	      return (values[0]);
+	    else
+	      return (null);	}
+
+	public Map<String, String[]> getParameterMap() {
+	    parseParameters();
+	    return (this.parameters);
+	}
+
+	public Enumeration<String> getParameterNames() {
+	    parseParameters();
+	    return (Collections.enumeration(parameters.keySet()));
+	}
+
+	public String[] getParameterValues(String name) {
+	    parseParameters();
+	    String values[] = (String[]) parameters.get(name);
+	    if (values != null)
+	      return (values);
+	    else
+	      return null;
+	}
+
+注意了，我们都是在具体取参数的时候再parseParameters()，将时序放到这里，是为了性能。
+
+
+
+----------------------Day 12------------------------------------------
+我们已经从request中解析出了request line, headers和parameters。
+现在我们解析cookie。
+Cookie是放在header中的，格式为：
+Cookie: userName=yale; password=pwd;
+
+所以，我们再解析header的时候，如果发现header name是Cookie，就进一步解析cookie。
+Cookie的数据结构遵从javax.servlet.http.Cookie规定，由于request中可以包含多个
+cookie，所以我们会用一个[]来存储。
+
+有了cookie后，我们要进一步看看session。
+http本身是无状态的，但是许多场景又需要记住状态，Servlet规范就规定了Session记住用户状态。
+它由服务器创建，Session有个SessionID，依靠url或者是cookie传送，规定名为jsessionid.
+以后浏览器与服务器之间的数据交换，都带上这个jsessionid. 然后程序可以根据jsessionid拿到这个session，
+将一些状态数据存储在session中。
+一个session其实可以简单地看成一个map，然后由我们的server为每个客户端创建一个session。
+Servlet规范中，定义了javax.servlet.http.HttpSession。
+
+我们用一个类实现public class Session implements HttpSession
+
+要搞清楚几点：
+创建session的是server，即servlet容器，比如Tomcat或者Minit。
+客户程序对servlet的处理流程里会用到session，用session存储一些数据。
+程序员通过HttpServletRequest#getSession()会返回一个HttpSession。
+创建session，servlet容器收到http请求之后需要根据http信息创建session，也可以再客户程序getSession的时候创建。
+创建好session之后，Response里面会回写这个sessionid，这是通过再响应头中set-cookie来做到的。
+
+
+交互流程：
+一个全新的client发送http请求到Tomcat server；
+Tomcat发现这是一个全新的请求，为它创建session，分配session id，并在response里设置Set-Cookie header
+Tomcat或者servlet可能在session里存放了某些内容；
+client再次请求，cookie header里带上session id；
+Tomcat发现请求带有session id，根据id匹配到session，并取出之前存放在session里的内容。
+
+记住，session不一定要依赖cookie（有时候会设置不接受cookie），也可以通过url中带上jsessionid来做到,如：
+TestServlet;jsessionid=5AC6268DD8D4D5D1FDF5D41E9F2FD960?curAlbumID=9
+可以看到浏览器是在URI之后加上;jsessionid=来传递session，不是普通的参数格式。
+
+request的parse:
+	public void parse(Socket socket) {
+		try {
+			parseConnection(socket);
+			this.sis.readRequestLine(requestLine);
+			parseRequestLine();
+            parseHeaders();
+
+我们会在request的parse中分别从querystring和cookie header中解析出jsessionid.
+	parseRequestLine():
+	        queryString=new String(requestLine.uri, question + 1, requestLine.uriEnd - question - 1);
+	        uri = new String(requestLine.uri, 0, question);
+	        //handle session
+	        int semicolon = uri.indexOf(";jessionid=");
+	        if (semicolon >= 0) {
+	        	sessionid = uri.substring(semicolon+";jessionid=".length());
+	        }
+	parseHeaders():	        
+			else if (header.equals(DefaultHeaders.COOKIE_NAME)) {
+	                headers.put(name, value);
+	                Cookie[] cookiearr = parseCookieHeader (value);
+	                this.cookies = cookiearr;
+	                //check jsessionid
+	                for (int i = 0; i < cookies.length; i++) {
+	                    if (cookies[i].getName().equals("jsessionid")){
+	                    	this.sessionid=cookies[i].getValue();
+	                        //this.session = HttpConnector.sessions.get(this.sessionid);
+	                    }
+	                }
+我们现在只是解析出jsessionid，并没有对应的session.按照程序的时序，如果querystring和cookie中都有
+jsessionid，则优先用cookie中的。
+
+客户程序总是通过request.grtSession()拿到的session，因此，我们会在Request中提供session引用和相应的方法。
+
+由于一个server要服务多个客户端，所以要有一个大的map存放全部session，key就是jsessionid.
+我们先把这个map放在connector中，因为connector是全局的。
+public static Map<String,HttpSession> sessions = new ConcurrentHashMap<>();
+createSession以及generateSesionId也都放在connector中。
+
+今后我们会进一步分解功能，通过container和manager来管理session。
+
+因为connector会接受socket之后，给processor分配socket，parse它，并创建request和response，然后进行处理。
+所以我们先在HttpProcessor这个地方进行session处理。
+            // create Request object and parse
+            HttpRequest request = new HttpRequest(input);
+            request.parse(socket);
+            
+            //handle session
+            if (request.getSessionId()==null || request.getSessionId().equals("")) {
+            	request.getSession(true);
+            }
+parse()程序，我们改过，增加对queryString和cookie中的jsessionid的检查。
+parse完成后就调用一下getSession(true).
+这个getSession里面会判断有没有session，如果没有就创建。一个问题是，每次都是新建的request，
+那么session一定是null，这里我们会进一步判断jsessionid，如果parse后的结果中有jsessionid，我们会用
+这个jsessionid从connector的全局session map中查找相应的session。
+	public HttpSession getSession(boolean create) {
+		if (session != null)
+			return session;
+		if (sessionid != null) {
+			session = HttpConnector.sessions.get(sessionid);
+			if (session != null)
+				return session;
+			else {
+				session = HttpConnector.createSession();
+				sessionid = session.getId();
+				return session;
+			}
+		} else {
+			session = HttpConnector.createSession();
+			sessionid = session.getId();
+			return session;			
+		}
+	}
+
+connector中创建session的过程：
+	public static Session createSession() {
+        Session session = new Session();
+
+        // Initialize the properties of the new session and return it
+        session.setValid(true);
+        session.setCreationTime(System.currentTimeMillis());
+        String sessionId = generateSessionId();
+        session.setId(sessionId);
+
+        sessions.put(sessionId, session);
+
+        return (session);
+    }
+
+最后，由于servlet程序中是这么用的：
+	public void doGet(HttpServletRequest request, HttpServletResponse response)throws ServletException, IOException {
+		HttpSession session = request.getSession(true);
+	}
+如果用户知道内部的实现，可以将这个session强行转换，这样会暴露出很多内部使用的额外的方法。
+于是，老办法，用以恶SessionFacade包装一下，给request里面传递的是这个sessionfacade让它对外。
+
+现在Minit可以创建session，存储数据了。
+遗留的问题就是，为了多次往返的时候带上这个jsessionid，我们需要response中把它写回去，让客户程序知道。
+接下来再讲。
+
+------------------------------Day 13-------------------------------------------------
+现在我们再response中处理 session，使得往返都能带上session.
+根据规范，response header中写上如下格式即可。
+Set-Cookie: <cookie-name>=<cookie-value>
+Set-Cookie: <cookie-name>=<cookie-value>; Expires=<date>
+Set-Cookie: <cookie-name>=<cookie-value>; Max-Age=<number>
+Set-Cookie: <cookie-name>=<cookie-value>; Domain=<domain-value>
+Set-Cookie: <cookie-name>=<cookie-value>; Path=<path-value>
+Set-Cookie: <cookie-name>=<cookie-value>; Secure
+
+我们就用最基本的格式。
+Set-Cookie: jsessionid=FA73014B317A489994D0B394F4EBF4EA
+
+用到了一个拼串的工具类CookieTools
+
+我们再response的sendHeaders()中增加如下代码：
+	    // Add the session ID cookie if necessary
+	    HttpSession session = this.request.getSession(false);
+	    if (session != null) {
+            Cookie cookie = new Cookie(DefaultHeaders.COOKIE_NAME,session.getId());
+            addCookie(cookie);
+        }
+
+        // Send all specified cookies (if any)
+        synchronized (cookies) {
+            Iterator<Cookie> items = cookies.iterator();
+            while (items.hasNext()) {
+                Cookie cookie = (Cookie) items.next();
+                outputWriter.print(CookieTools.getCookieHeaderName(cookie)); //set-cookie
+                outputWriter.print(": ");
+                StringBuffer sbValue = new StringBuffer();
+                CookieTools.getCookieHeaderValue(cookie,sbValue); //name=value
+                outputWriter.print(sbValue.toString());
+                outputWriter.print("\r\n");
+            }
+        }
+
+
+
+------------------------------Day 14-----------------------------------
+到目前为止，一个socket连接建立后，processor处理的过程是包装成request传递给servlet，回应后，
+processor会把这个socket关闭掉。代码结构如下：
+	public void process(Socket socket) {
+        InputStream input = null;
+        OutputStream output = null;
+        try {
+            input = socket.getInputStream();
+            output = socket.getOutputStream();
+
+            HttpRequest request = new HttpRequest(input);
+            request.parse(socket);
+            
+            HttpResponse response = new HttpResponse(output);
+            response.setRequest(request);
+            if (request.getUri().startsWith("/servlet/")) {
+              ServletProcessor processor = new ServletProcessor();
+              processor.process(request, response);
+            }
+            else {
+              StaticResourceProcessor processor = new StaticResourceProcessor();
+              processor.process(request, response);
+            }
+
+            // Close the socket
+            socket.close();
+        }
+    }
+但是一个web page上可能还有很多部分，需要再次访问服务器拿到相应资源，每次都会重新
+建立一个socket，挺浪费的，性能也不好。
+HTTP 1.1可以建立持续的连接Keep Alive. 默认的就是持续连接，request头信息也可以明示出来：
+connection: keep-alive
+持续的连接中，服务器不会关闭socket，这样一个web page和它相关的资源会共用同一个连接。
+客户端服务端之间可以有多次request stream和response stream。这样的一个结果是，发送数据流
+的时候，我们不知道Content Length了。所以要有一个办法解决没有content length的情况下如何
+解释数据流的问题。实际上，即使不考虑多次request和response的场景，是要服务端的内容是动态
+产生的，也会有了不知道content length的问题。
+
+HTTP 1.1用了一个特殊的头信息transfer-encoding来表明数据流用chunk方式发送，即分块发送：
+Transfer-Encoding: chunked
+
+数据格式如下：
+[chunk size][\r\n][chunk data][\r\n][chunk size][\r\n][chunk data][\r\n][chunk size = 0][\r\n][\r\n]
+编码使用若干个chunk组成，由一个标明长度为0的chunk结束。每个chunk有两部分组成，第一部分是
+该chunk的长度，第二部分就是指定长度的内容，每个部分用CRLF隔开。在最后一个长度为0的chunk结束。
+
+这样，就可以按照这个格式一部分一部分发送数据了。
+有了chunk就不用content length了。
+
+响应包示例：
+HTTP/1.1 200 OK
+Content-Type: text/plain
+Transfer-Encoding: chunked
+
+25
+This is the data in the first chunk
+1C
+and this is the second one
+3
+con
+8
+sequence
+0
+
+怎么告诉对方整个事情完成了呢？也是通过一个头信息：
+Connection: close
+
+程序结构上，只要把processor的process()过程中加上keepalive判断，
+如果为false才关掉socket.
+	public void process(Socket socket) {
+        InputStream input = null;
+        OutputStream output = null;
+        try {
+            input = socket.getInputStream();
+            output = socket.getOutputStream();
+            
+            keepAlive = true;
+
+            while (keepAlive) {
+	            // create Request object and parse
+	            HttpRequest request = new HttpRequest(input);
+	            request.parse(socket);
+	            
+	            //handle session
+	            if (request.getSessionId()==null || request.getSessionId().equals("")) {
+	            	request.getSession(true);
+	            }
+	
+	            // create Response object
+	            HttpResponse response = new HttpResponse(output);
+	            response.setRequest(request);
+	//               response.sendStaticResource();
+	    
+	            // check if this is a request for a servlet or a static resource
+	            // a request for a servlet begins with "/servlet/"
+	            if (request.getUri().startsWith("/servlet/")) {
+	              ServletProcessor processor = new ServletProcessor();
+	              processor.process(request, response);
+	            }
+	            else {
+	              StaticResourceProcessor processor = new StaticResourceProcessor();
+	              processor.process(request, response);
+	            }
+	            
+	            if ( "close".equals(response.getHeader("Connection")) ) {
+	                keepAlive = false;
+	            }            
+            }
+
+            // Close the socket
+            socket.close();
+            socket=null;
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+	}
+
+收到Connection: close头信息之后，把keepAlive=false，然后退出循环后关闭socket。
+
+而客户端也可以再请求头中加上Connection: close
+所以HttpRequest的parseHeaders程序改成：
+else if (name.equals(DefaultHeaders.CONNECTION_NAME)) {
+	                headers.put(name, value);
+	                if (value.equals("close")) {
+	                    response.setHeader("Connection", "close");
+	                }
+也进行connection close处理。	               
+
+
+测试程序：
+public class TestServlet extends HttpServlet{
+	static int count = 0;
+	private static final long serialVersionUID = 1L;
+	
+	@Override
+	public void doGet(HttpServletRequest request, HttpServletResponse response)throws ServletException, IOException {
+		TestServlet.count++;
+		if (TestServlet.count>2) {
+			response.addHeader("Connection", "close");
+		}	
+		
+		response.setCharacterEncoding("UTF-8");
+		String doc = "<!DOCTYPE html> \n" +
+	            "<html>\n" +
+	            "<head><meta charset=\"utf-8\"><title>Test</title></head>\n"+
+	            "<body bgcolor=\"#f0f0f0\">\n" +
+	            "<h1 align=\"center\">" + "Test 你好" + "</h1>\n";
+	    response.getWriter().println(doc);
+
+	}
+Servlet里面用一个静态全局计数器，如果是第三次以上，set Connection:close
+我么能从浏览器可以看到，第一次第二次访问之后，数据返回但是浏览器连接没有停，第三次后才停下来。
+说明了KeepAlive起作用了。
+
+注意：我们以前在ServletProcessor中梅西新建了一个ClassLoader,现在该为全局的，我们把ClassLoader初始化放在Connector中。
+
+
+
+注意：w我们以前再ServletProcessor中是这么写的：
+response.sendHeaders();
+servlet.service(requestFacade, responseFacade);
+我们修改一下时序，在ServletProcessor中不管header了，只调用servlet.service(requestFacade, responseFacade);
+回到Processor中的process()，处理响应头，并再进行一个finishResponse()操作：
+   	    	response.sendHeaders();
+            ServletProcessor processor = new ServletProcessor();
+            processor.process(request, response);
+            finishResponse();
+下面是resposne中发送响应头的代码：
+	public void sendHeaders() throws IOException {
+		PrintWriter outputWriter = getWriter();
+		 ... ...
+      // Send a terminating blank line to mark the end of the headers
+	    outputWriter.print("\r\n");
+	    outputWriter.flush();
+	}
+	
+这个finishResponse()实现如下：
+	private void finishResponse(){
+			response.finishResponse();
+	}
+发送响应体
+	public void finishResponse() {
+			this.getWriter().flush();
+	}
+
+*****************************************问题记录****************************************
+理想中的写法应该是这么写的：
+servlet.service(requestFacade, responseFacade);
+response.sendHeaders();
+response.finishResponse();
+先调用客户servlet service(), 再回写header，再调用finishResponse()写回响应体。
+
+但是没有实现，面临一个问题没有解决：如果客户Servlet中如果用了setHeader() addHeader()就会有
+一个冲突：调用service()的时候已经把响应通过writer发走了。再写header就不行了。
+
+不知道Tomcat实际怎么解决的？
+*****************************************End 问题记录****************************************
+
+
+-----------------------------Day 15-----------------------------------
+到目前为止，我们已经把浏览器与服务器之间的通信处理得差不多了，现在再看看后端。
+现在我们是用一个ServletProcessor简单地调用Servlet的service，需要扩展一下，
+对servlet进行管理。这就是container的概念。
+
+Container和Connector配合在一起工作，一个负责通信管理，一个负责后端servlet管理。
+大体上程序可以这么安排：
+HttpConnector connector = new HttpConnector();
+Container container = new Container();
+connector.setContainer(container);
+
+Container管理servlet，invoke servlet.
+
+我们以前直接把classloader放在了connector里面，public static URLClassLoader loader = null;
+我们现在改造一下，用Container管理ClassLoader，并提供一个getLoader()方法：
+public class ServletContainer {
+	HttpConnector connector = null;
+	ClassLoader loader = null;
+
+	public ServletContainer() {
+		try {
+			// create a URLClassLoader
+			URL[] urls = new URL[1];
+			URLStreamHandler streamHandler = null;
+			File classPath = new File(HttpServer.WEB_ROOT);
+			String repository = (new URL("file", null, classPath.getCanonicalPath() + File.separator)).toString() ;
+			urls[0] = new URL(null, repository, streamHandler);
+			loader = new URLClassLoader(urls);
+		} catch (IOException e) {
+			System.out.println(e.toString() );
+		}
+	}
+}
+
+以前在ServletProcessor中调用servlet的代码挪到Container的invoke()中：
+	public void invoke(HttpRequest request, HttpResponse response)
+			throws IOException, ServletException {
+		ClassLoader loader = getLoader();
+		String uri = request.getUri();
+		String servletName = uri.substring(uri.lastIndexOf("/") + 1);
+
+		response.setCharacterEncoding("UTF-8");
+
+		Class<?> servletClass = null;
+		servletClass = getLoader().loadClass(servletName);
+
+		Servlet servlet = null;
+		try {
+			servlet = (Servlet) servletClass.newInstance();
+			HttpRequestFacade requestFacade = new HttpRequestFacade(request);
+			HttpResponseFacade responseFacade = new HttpResponseFacade(response);
+
+			servlet.service(requestFacade, responseFacade);
+		}
+	}
+
+HttpServer修改：
+    public static void main(String[] args) {
+        HttpConnector connector = new HttpConnector();
+        ServletContainer container = new ServletContainer();
+        connector.setContainer(container);
+        container.setConnector(connector);
+        connector.start();
+    }
+
+上面的container中，invoke的时候每次都是load servlet class，实例化，调用service.
+我们进一步把servlet放到Map中存起来，使得container像一个container，包含了很多servlet实例。
+	Map<String,String> servletClsMap = new ConcurrentHashMap<>(); //servletName - ServletClassName
+	Map<String,Servlet> servletInstanceMap = new ConcurrentHashMap<>();//servletName - servlet
+invoke的时候，
+		servlet = servletInstanceMap.get(servletName); 
+		if ( servlet == null) {
+			Class<?> servletClass = null;
+			servletClass = loader.loadClass(servletClassName);
+			servlet = (Servlet) servletClass.newInstance();
+			
+			servletClsMap.put(servletName, servletClassName);
+			servletInstanceMap.put(servletName, servlet);
+			
+			servlet.init(null);
+		}
+		try {
+			HttpRequestFacade requestFacade = new HttpRequestFacade(request);
+			HttpResponseFacade responseFacade = new HttpResponseFacade(response);
+			System.out.println("Call service()");
+
+			servlet.service(requestFacade, responseFacade);
+		}
+如果有servlet实例，就直接调用service()，如果没有实例，就load并创建实例，并init()。
+
+
+--------------------------Day 16-------------------------------------------------
+再进一步。
+为了便于管理servlet,我们可以用一个Wrapper进行包装，主要是维护Servlet的生命周期：
+init, service, and destroy 
+Wrapper程序的主要方法是loadServlet，通过一个classloader加载并实例化servlet,然后进行初始化init()
+
+其实就是刚才我们在ServletContainer里面做的主要工作。
+
+public class ServletWrapper {
+	private Servlet instance = null;
+	private String servletClass;
+	private ClassLoader loader;
+	private String name;
+	protected ServletContainer parent = null;
+}
+	public Servlet loadServlet() throws ServletException {
+	    if (instance!=null)
+	      return instance;
+
+	    Servlet servlet = null;
+	    String actualClass = servletClass;
+	    ClassLoader classLoader = getLoader();
+
+	    // Load the specified servlet class from the appropriate class loader
+	    Class classClass = null;
+        classClass = classLoader.loadClass(actualClass);
+
+	    // Instantiate and initialize an instance of the servlet class itself
+	    servlet = (Servlet) classClass.newInstance();
+
+	    // Call the initialization method of this servlet
+        servlet.init(null);
+
+	    return servlet;
+	  }
+
+	public void invoke(HttpRequest request, HttpResponse response)
+			throws IOException, ServletException {
+		if (instance != null) {
+			instance.service(request, response);
+		}
+	}
+
+相应地修改ServletContainer,里面包含的map是wrapper的map：
+	Map<String,ServletWrapper> servletInstanceMap = new ConcurrentHashMap<>();//servletName - servletWrapper
+invoke()也响应改动：
+		servletWrapper = servletInstanceMap.get(servletName); 
+		if ( servletWrapper == null) {
+			servletWrapper = new ServletWrapper(servletClassName);
+			servletWrapper.setParent(this);
+			
+			this.servletClsMap.put(servletName, servletClassName);
+			this.servletInstanceMap.put(servletName, servletWrapper);
+		}
+
+		try {
+			HttpServletRequest requestFacade = new HttpRequestFacade(request);
+			HttpServletResponse responseFacade = new HttpResponseFacade(response);
+			System.out.println("Call service()");
+
+			servletWrapper.invoke(requestFacade, responseFacade);
+		}
+container只拿到wrapper,调用wrapper的invoke()
+
+
+-----------------------------------Day 17----------------------------------------
+实际上，Tomcat把Wrapper也看成是一种container,属于context之下的child container.
+原理上有多层Container
+一个Minit提供http服务，可以想象它可以管理多个虚拟主机，每个虚拟主机下又有多个应用，
+每个应用又包含多个servlet。所以container有多个，一层套一层。
+用Tomcat的讲法，Engine, Host, Context, and Wrapper。
+
+我们也按照这个思路，讲我们的ServletContainer改成Context，但是不打算实现engine和host，
+只用两层container.(原因是engine, host本身带来结构复杂，是二十年前的思想，现代用了容器
+技术之后，host/engine的概念已经很弱化了，实际上我们部署的时候，一个tomcat一般就只用
+一个engine一个host，如果如要多个，就用多个容器。)
+
+先提出一个container interface.
+public interface Container {
+    public static final String ADD_CHILD_EVENT = "addChild";
+    public static final String REMOVE_CHILD_EVENT = "removeChild";
+
+    public String getInfo();
+    public ClassLoader getLoader();
+    public void setLoader(ClassLoader loader);
+    public String getName();
+    public void setName(String name);
+    public Container getParent();
+    public void setParent(Container container);
+    public void addChild(Container child);
+    public Container findChild(String name);
+    public Container[] findChildren();
+    public void invoke(HttpServletRequest request, HttpServletResponse response)
+        throws IOException, ServletException;
+    public void removeChild(Container child);
+}
+主要有ClassLoader，有Child和Parent，以及调用方法invoke()
+
+由于有两到多层Container，很多是共同的，所以我们再弄一个ContainerBase作为基类。
+这个基类做了基本的工作，child和loader的管理。
+public abstract class ContainerBase implements Container {
+	protected Map<String,Container> children = new ConcurrentHashMap<>();
+	protected ClassLoader loader = null;
+	protected String name = null;
+	protected Container parent = null;
+}
+
+然后我们把ServletContainer改名为ServletContext，并extends ContainerBase
+ServletWrapper也extends ContainerBase,不过Wrapper是最后一层container，没有child，
+所以与child有关的几个方法全部留空。
+
+到现在为止，我们有了Server，有了Connector处理连接，包装request和response，支持Keep Alive。
+还有了两个Container（一个Context一个wrapper），可以load servlet，可以调用servlet service()。
+一个简单的Servlet服务器就搭建起来了。
+
+当然，我么这个Minit还很是初级的，为了学习的目的，下面我们按照Tomcat的方式进行一些补充，
+也加深对Tomcat的理解。
+
+---------------------------------Day 18---------------------------------------
+我们先按照Tomcat的目录结构重新整理一下我们的程序结构。
+我们看到，Tomcat的查询主要在org.apache.catalina里面，基本的子包有:
+/startup
+/core
+/connector
+/loader
+/logger
+/session
+/util
+等等。
+我们也模仿一下，大包叫com.minit.
+
+/startup下就一个类HttpServer
+
+为了规范，还要加几个interface：
+Connector	Context		Wrapper		Request		Response	Session
+
+以前我们有叫这些名字的类，也改名并实现上面的接口：
+ServletContext改名叫StandardContext
+ServletWrapper改名叫StandardWrapper
+Session改名叫StandardSession
+SessionFacade改名叫StandardSessionFacade
+HttpRequest改名叫HttpRequestImpl
+HttpResponse改名叫HttpResponseImpl
+HttpServer改名叫Bootstrap
+Request去掉
+Response去掉
+
+
+现在，我们的Minit长得有点像是Tomcat了。
+
+--------------------------------Day 19----------------------------------------
+再丰富一下，增加log.
+com.minit下增加一个interface Logger:
+public interface Logger {
+    public static final int FATAL = Integer.MIN_VALUE;
+    public static final int ERROR = 1;
+    public static final int WARNING = 2;
+    public static final int INFORMATION = 3;
+    public static final int DEBUG = 4;
+
+    public void log(String message);
+    public void log(Exception exception, String msg);
+}
+
+增加package com.minit.logger，提供一个LoggerBase:
+public void log(String msg, Throwable throwable) {
+    CharArrayWriter buf = new CharArrayWriter();
+    PrintWriter writer = new PrintWriter(buf);
+    writer.println(msg);
+    throwable.printStackTrace(writer);
+    Throwable rootCause = null;
+    if  (throwable instanceof ServletException)
+        rootCause = ((ServletException) throwable).getRootCause();
+    if (rootCause != null) {
+        writer.println("----- Root Cause -----");
+        rootCause.printStackTrace(writer);
+    }
+    log(buf.toString());
+}
+如果有Exception，则后端printStackTrace，然后记录日志（具体类实现）。
+
+具体实现类有FileLogger,根据时间自动生成一个文件：
+private String date = "";
+private String directory = "logs";
+private String prefix = "minit.";
+private StringManager sm = StringManager.getManager(Constants.Package);
+private boolean started = false;
+private String suffix = ".log";
+private PrintWriter writer = null;
+
+根据上面的属性，查询会在 logs/目录下生成一个类似minit.2022-08-31.log的文件，
+内部记录一个date，表示这个文件是什么时候创建的，如果date与当前日期不一样就
+关闭当前文件，还创建一个新的文件。这样每天的日志文件不同。
+
+public void log(String msg) {
+    // Construct the timestamp we will use, if requested
+    Timestamp ts = new Timestamp(System.currentTimeMillis());
+    String tsString = ts.toString().substring(0, 19);
+    String tsDate = tsString.substring(0, 10);
+
+    // If the date has changed, switch log files
+    if (!date.equals(tsDate)) {
+        synchronized (this) {
+            if (!date.equals(tsDate)) {
+                close();
+                date = tsDate;
+                open();
+            }
+        }
+    }
+
+    // Log this message, timestamped if necessary
+    if (writer != null) {
+        if (timestamp) {
+            writer.println(tsString + " " + msg);
+        } else {
+            writer.println(msg);
+        }
+    }
+}
+
+open()新开一个文件：
+private void open() {
+    File dir = new File(directory);
+    if (!dir.isAbsolute())
+        dir = new File(System.getProperty("catalina.base"), directory);
+    dir.mkdirs();
+
+    // Open the current log file
+    try {
+        String pathname = dir.getAbsolutePath() + File.separator +
+            prefix + date + suffix;
+        writer = new PrintWriter(new FileWriter(pathname, true), true);
+    } catch (IOException e) {
+        writer = null;
+    }
+}
+
+这个Logger在BootStrap中创建，并指派给Container使用：
+        HttpConnector connector = new HttpConnector();
+        StandardContext container = new StandardContext();
+        connector.setContainer(container);
+        container.setConnector(connector);
+        
+        Logger logger = new FileLogger();
+        container.setLogger(logger);
+        
+        connector.start();
+为什么要指派给container?因为预备后来多个container的时候可以不同的Logger使用不用的目录和文件。
+
+---------------------------------------Day 20----------------------------------------------------
+当服务器要调用某个具体的servlet的时候，是先经过这些container一层一层调用的，
+Tomcat每个container的invoke()，是通过一个特别的模式来调用的，我们一点点照着实现。
+
+每一个container内部在真正的任务执行前（如执行servlet），又经过一些过滤层，叫做valve，
+一个一个执行valve之后再执行servlet，给容器做一些过滤的机会，比如权限、日志、报错等等。
+可以这么理解container调用各个valves：
+// invoke each valve added to the pipeline
+for (int n=0; n < valves.length; n++) {
+  valves[n].invoke( ... );
+}
+servlet.service( ... );
+
+但是从Tomcat的实现中，我们看到的是另外一种调用模式。container的invoke()没有硬编码，
+而是调用的pipeline的invoke.
+public void invoke(Request request, Response response) throws IOException, ServletException {
+    pipeline.invoke(request, response);
+}
+这个pipeline来调用每一个valve。程序结构是Chain of Responsibility, pipeline调用第一个valve，
+然后第一个负责调用第二个，一直往下。
+public void invoke(Request request, Response response,) throws IOException, ServletException {
+  // Pass the request and response on to the next valve in our pipeline
+     invokeNext(request, response);
+  // now perform what this valve is supposed to do
+  ...
+}
+
+简单来讲，就是每一层container都有一个pipeline，这个pipeline是一个链条，这个链条由
+许多valve串起来。
+调用某个container的invoke()，内部是找到pipeline的第一个valve，调用它，这第一个valve
+会调用下一个，一个一个传下去，最后到最后一个basic valve，然后调用下一层容器，直到结束。
+每个container里面有个默认的basic valve，它是最后被调用的。
+这个模式叫做chain of responsibility。
+
+先看Valve。
+public interface Valve {
+  public String getInfo();
+  public void invoke(Request request, Response response,ValveContext context) throws IOException, ServletException;
+}
+然后提供一个基类ValveBase:
+public abstract class ValveBase implements Valve {
+protected Container container = null;
+protected int debug = 0;
+protected static String info = "com.minit.valves.ValveBase/0.1";
+
+public Container getContainer() {
+    return (container);
+}
+
+public void setContainer(Container container) {
+    this.container = container;
+}
+
+public int getDebug() {
+    return (this.debug);
+}
+
+public void setDebug(int debug) {
+    this.debug = debug;
+}
+
+public String getInfo() {
+    return (info);
+}
+
+public abstract void invoke(Request request, Response response,ValveContext context)
+    throws IOException, ServletException;
+
+}
+
+Tomcat提供了一些内置的valve，我门可以用一个日志的AccessLogValve。
+public void invoke(Request request, Response response, ValveContext context) throws IOException, ServletException {
+    // Pass this request on to the next valve in our pipeline
+    context.invokeNext(request, response);
+
+    LocalDate date = getDate();
+    StringBuffer result = new StringBuffer();
+
+    // Check to see if we should log using the "common" access log pattern
+        String value = null;
+
+        ServletRequest req = request.getRequest();
+        HttpServletRequest hreq = null;
+        if (req instanceof HttpServletRequest)
+            hreq = (HttpServletRequest) req;
+
+        result.append(req.getRemoteAddr());
+
+        result.append(" - ");
+
+        if (hreq != null)
+            value = hreq.getRemoteUser();
+        if (value == null)
+            result.append("- ");
+        else {
+            result.append(value);
+            result.append(space);
+        }
+
+        result.append("[");
+        result.append(dayFormatter.format(date));            // Day
+        result.append('/');
+        result.append(lookup(monthFormatter.format(date))); // Month
+        result.append('/');
+        result.append(yearFormatter.format(date));            // Year
+        result.append(':');
+        result.append(timeFormatter.format(date));        // Time
+        result.append(space);
+        result.append(timeZone);                            // Time Zone
+        result.append("] \"");
+
+        result.append(hreq.getMethod());
+        result.append(space);
+        result.append(hreq.getRequestURI());
+        if (hreq.getQueryString() != null) {
+            result.append('?');
+            result.append(hreq.getQueryString());
+        }
+        result.append(space);
+        result.append(hreq.getProtocol());
+        result.append("\" ");
+
+        result.append(((HttpResponseImpl) response).getStatus());
+
+        result.append(space);
+
+        int length = response.getContentCount();
+
+        if (length <= 0)
+            value = "-";
+        else
+            value = "" + length;
+        result.append(value);
+
+    log(result.toString(), date);
+}
+valve的核心方法是invoke()，根据职责链模式，里面就有一个invokeNext()调用下一个valve,然后记录日志。
+怎么知道下一个是谁呢？我们就得让pipeline维持这个链条，并把上下文传给valve，所以引入ValveContxt.
+
+public interface ValveContext {
+    public String getInfo();
+    public void invokeNext(Request request, Response response) throws IOException, ServletException;
+}
+
+
+这是Pipeline的接口定义：
+public interface Pipeline {
+  public Valve getBasic();
+  public void setBasic(Valve valve);
+  public void addValve(Valve valve);
+  public Valve[] getValves();
+  public void invoke(Request request, Response response) throws IOException, ServletException;
+  public void removeValve(Valve valve);
+  public void invokeNext(Request request, Response response) throws IOException, ServletException;
+}
+
+StandardPipeline的实现里面用了一个数组保存当前valves
+protected Valve valves[] = new Valve[0];
+也有一个单独的protected Valve basic = null;
+
+对pipeline的调用转成了启动StandardPipelineValveContext的invokeNext()：
+public void invoke(Request request, Response response)
+    throws IOException, ServletException {
+    // Invoke the first Valve in this pipeline for this request
+    (new StandardPipelineValveContext()).invokeNext(request, response);
+}
+内部类StandardPipelineValveContext中维持了一个stage，记录valves的编号：
+protected class StandardPipelineValveContext implements ValveContext {
+    protected int stage = 0;
+    public void invokeNext(Request request, Response response) throws IOException, ServletException {
+        int subscript = stage;
+        stage = stage + 1;
+        // Invoke the requested Valve for the current request thread
+        if (subscript < valves.length) {
+            valves[subscript].invoke(request, response, this);
+        } else if ((subscript == valves.length) && (basic != null)) {
+            basic.invoke(request, response, this);
+        } else {
+            throw new ServletException("standardPipeline.noValve");
+        }
+    }
+}
+根据编号调用valve.invoke(),最后到头之后，要调用basic valve.
+
+前面说过，valve的invoke()方法就是调用ValveContext的invokeNext()然后执行本身的任务。
+public void invoke(Request request, Response response, ValveContext context) throws IOException, ServletException {
+    // Pass this request on to the next valve in our pipeline
+    context.invokeNext(request, response);
+    log(result.toString(), date);
+}
+
+这样一个一个传递下去，整个链条调用完毕。
+
+因为整个Server的起点是connector和container,所以我们需要把pipeline加入到container中。
+回头修改ContainerBase：
+	protected Pipeline pipeline = new StandardPipeline(this);	
+    public Pipeline getPipeline() {
+        return (this.pipeline);
+    }
+    public void invoke(Request request, Response response) throws IOException, ServletException {
+            pipeline.invoke(request, response);
+    }
+    public synchronized void addValve(Valve valve) {
+        pipeline.addValve(valve);
+    }
+给ContainerBase加上pipeline相关的方法，invoke()变成调用pipeline.invoke()
+
+StandardContext构造方法改一下，增加pipeline的维护：
+	public StandardContext() {
+        super();
+        pipeline.setBasic(new StandardContextValve());
+	}
+StandardContext里面的invoke就很简单了，只要调用ContainerBase的invoke()启动pipeline()
+	public void invoke(Request request, Response response)
+			throws IOException, ServletException {
+		super.invoke(request, response);
+	}
+
+而我们以前写在StandardContext里面的invoke代码，现在要用一个StandardContextValve的invoke()来取代了：
+public void invoke(Request request, Response response, ValveContext valveContext)
+    throws IOException, ServletException {
+	StandardWrapper servletWrapper = null;
+	String uri = ((HttpRequestImpl)request).getUri();
+	String servletName = uri.substring(uri.lastIndexOf("/") + 1);
+	String servletClassName = servletName;
+
+	StandardContext context = (StandardContext)getContainer();
+	
+	servletWrapper = (StandardWrapper)context.getWrapper(servletName); 
+
+	servletWrapper.invoke(request, response);
+}
+context就是包含的contain，即StandardContext,从这里面拿到Wrapper后直接调用。这里没有invokeNext()，
+应为这个valve是basic,最后一个调用的。
+
+同样，以前写在StandardWrapper里面的invoke代码，现在也要用一个Valve来取代了：
+	public StandardWrapper(String servletClass,StandardContext parent) {
+        super();
+        pipeline.setBasic(new StandardWrapperValve());
+	}
+	public void invoke(Request request, Response response)
+			throws IOException, ServletException {
+		super.invoke(request, response);
+	}
+
+public class StandardWrapperValve extends ValveBase {
+	public void invoke(Request request, Response response, ValveContext context) throws IOException, ServletException {
+		// TODO Auto-generated method stub
+		HttpServletRequest requestFacade = new HttpRequestFacade((HttpRequestImpl) request);
+		HttpServletResponse responseFacade = new HttpResponseFacade((HttpResponseImpl) response);
+
+		Servlet instance = ((StandardWrapper)getContainer()).getServlet();
+		if (instance != null) {
+			instance.service(requestFacade, responseFacade);
+		}
+	}
+
+}
+
+运行一下，我们的Minit现在有模有样了。
+
+
+----------------------------------Day 21-------------------------------------
+我们继续丰富Minit，引入filter。
+servlet规范规定了Filter，FilterConfig和FilterChain接口。
+
+我们先用一个ApplicationFilterConfig来包装Filter：
+final class ApplicationFilterConfig implements FilterConfig {	
+    private Context context = null;
+    private Filter filter = null;
+    private FilterDef filterDef = null;
+
+    public ApplicationFilterConfig(Context context, FilterDef filterDef)
+        throws ClassCastException, ClassNotFoundException,
+               IllegalAccessException, InstantiationException,
+               ServletException {
+        super();
+        this.context = context;
+        setFilterDef(filterDef);
+    }
+
+    public String getFilterName() {
+        return (filterDef.getFilterName());
+    }
+
+    public String getInitParameter(String name) {
+        Map<String,String> map = filterDef.getParameterMap();
+        if (map == null)
+            return (null);
+        else
+            return ((String) map.get(name));
+    }
+    public Enumeration<String> getInitParameterNames() {
+        Map<String,String> map = filterDef.getParameterMap();
+        if (map == null)
+            return Collections.enumeration(new ArrayList<String>());
+        else
+            return (Collections.enumeration(map.keySet()));
+
+    }
+
+    public ServletContext getServletContext() {
+        return (this.context.getServletContext());
+    }
+
+    Filter getFilter() throws ClassCastException, ClassNotFoundException,
+        IllegalAccessException, InstantiationException, ServletException {
+
+        // Return the existing filter instance, if any
+        if (this.filter != null)
+            return (this.filter);
+
+        // Identify the class loader we will be using
+        String filterClass = filterDef.getFilterClass();
+        ClassLoader classLoader = null;
+        classLoader = context.getLoader();
+
+        ClassLoader oldCtxClassLoader =
+            Thread.currentThread().getContextClassLoader();
+
+        // Instantiate a new instance of this filter and return it
+        Class clazz = classLoader.loadClass(filterClass);
+        this.filter = (Filter) clazz.newInstance();
+        filter.init(this);
+        return (this.filter);
+    }
+}
+这个Config里面，有一个Filter及其定义，有Context信息，有参数信息。
+通过Config拿到Filter，并初始化。
+
+由于支持多个filterconfig，所以我们用一个链管理：
+final class ApplicationFilterChain implements FilterChain {
+    public ApplicationFilterChain() {
+        super();
+    }
+    private ArrayList<ApplicationFilterConfig> filters = new ArrayList<>();
+    private Iterator<ApplicationFilterConfig> iterator = null;
+
+    private Servlet servlet = null;
+
+    private void doFilter(ServletRequest request, ServletResponse response)
+        throws IOException, ServletException {
+        // Construct an iterator the first time this method is called
+        if (this.iterator == null)
+            this.iterator = filters.iterator();
+
+        // Call the next filter if there is one
+        if (this.iterator.hasNext()) {
+            ApplicationFilterConfig filterConfig =
+              (ApplicationFilterConfig) iterator.next();
+            Filter filter = null;
+            filter = filterConfig.getFilter();
+            filter.doFilter(request, response, this);
+            return;
+        }
+
+        // We fell off the end of the chain -- call the servlet instance
+            if ((request instanceof HttpServletRequest) &&
+                (response instanceof HttpServletResponse)) {
+                servlet.service((HttpServletRequest) request,
+                                (HttpServletResponse) response);
+            } else {
+                servlet.service(request, response);
+            }
+
+    }
+
+    void addFilter(ApplicationFilterConfig filterConfig) {
+        this.filters.add(filterConfig);
+    }
+}
+里面用一个ArrayList存放所有Filter，最重要的方法就是doFilter：
+    private void doFilter(ServletRequest request, ServletResponse response)
+            this.iterator = filters.iterator();
+        if (this.iterator.hasNext()) {
+            ApplicationFilterConfig filterConfig =
+              (ApplicationFilterConfig) iterator.next();
+            Filter filter = null;
+            filter = filterConfig.getFilter();
+            filter.doFilter(request, response, this);
+            return;
+        }
+用一个iterator指向filters链条，拿到第一个后指定 filter.doFilter(request, response, this)。
+注意，此处实施调用了第一个Filter.doFilter()，并不在chain来遍历的。
+还是Chain of Rsponsibility模式，有第一个Filter调用下一个，一个一个继续。
+
+所有Filter过滤完之后，执行servlet service.这也是filterchain自动完成的，service()
+成了chain之后的一个环节，所以processor和container不需要显示地调用service().
+
+有了这些准备后，我们把Filter加入到container中，每一层都可以加，我们只在
+StandardContext这一层保存，重新启动时在BootStrap加，调用的程序写StandardWrapperValve中。
+
+public class StandardContext extends ContainerBase implements Context{
+    private Map<String,ApplicationFilterConfig> filterConfigs = new ConcurrentHashMap<>();
+    private Map<String,FilterDef> filterDefs = new ConcurrentHashMap<>();
+    private FilterMap filterMaps[] = new FilterMap[0];
+}
+Bootstrap：
+    public static void main(String[] args) {
+        HttpConnector connector = new HttpConnector();
+        StandardContext container = new StandardContext();
+        connector.setContainer(container);
+        container.setConnector(connector);
+        
+        FilterDef filterDef = new FilterDef();
+        filterDef.setFilterName("TestFilter");
+        filterDef.setFilterClass("test.TestFilter");
+        container.addFilterDef(filterDef);
+        
+        FilterMap filterMap = new FilterMap();
+        filterMap.setFilterName("TestFilter");
+        filterMap.setURLPattern("/*");
+        container.addFilterMap(filterMap);
+        
+        container.filterStart();
+        
+        connector.start();
+    }
+
+public class StandardWrapperValve extends ValveBase {
+	public void invoke(Request request, Response response, ValveContext context) throws IOException, ServletException {
+		// TODO Auto-generated method stub
+		System.out.println("StandardWrapperValve invoke()");
+		Servlet instance = ((StandardWrapper)getContainer()).getServlet();
+
+		// Call the filter chain for this request
+		// NOTE: This also calls the servlet's service() method
+		ApplicationFilterChain filterChain = createFilterChain(request, instance);
+		if ((instance != null) && (filterChain != null)) {
+			filterChain.doFilter((ServletRequest)request, (ServletResponse)response);
+		}
+		filterChain.release();
+	}
+
+
+----------------------------------Day 22--------------------------------------------
+接着实现listener.
+我们现在有minit server,有嵌套的container（目前实现了两层servletContext和servletWrapper）,
+还有session等等机制。我们可以用listener监听这些机构的一些事件，如启动，超时，结束等等。
+
+我们定义InstanceListener，ContainerListener, SessionListener以及对应的Event。
+有了这些后，在响应的类里面加上addlistener/removelistener以及fireEvent()即可。
+比如StandardSession中：
+	public void addSessionListener(SessionListener listener) {
+        synchronized (listeners) {
+            listeners.add(listener);
+        }
+    }
+	public void removeSessionListener(SessionListener listener) {
+        synchronized (listeners) {
+            listeners.remove(listener);
+        }
+    }
+    public void fireSessionEvent(String type, Object data) {
+        if (listeners.size() < 1)
+            return;
+        SessionEvent event = new SessionEvent(this, type, data);
+        SessionListener list[] = new SessionListener[0];
+        synchronized (listeners) {
+            list = (SessionListener[]) listeners.toArray(list);
+        }
+        for (int i = 0; i < list.length; i++)
+            ((SessionListener) list[i]).sessionEvent(event);
+
+    }
+
+	public void setId(String sessionId) {
+		this.sessionid = sessionId;
+        fireSessionEvent(Session.SESSION_CREATED_EVENT, null);
+	}
+
+StandardContext:
+	private ArrayList<ContainerListenerDef> listenerDefs = new ArrayList<>();
+	private ArrayList<ContainerListener> listeners = new ArrayList<>();
+	public void addContainerListener(ContainerListener listener) {
+        synchronized (listeners) {
+            listeners.add(listener);
+        }
+    }
+	public void removeContainerListener(ContainerListener listener) {
+        synchronized (listeners) {
+            listeners.remove(listener);
+        }
+    }
+    public void fireContainerEvent(String type, Object data) {
+        if (listeners.size() < 1)
+            return;
+        ContainerEvent event = new ContainerEvent(this, type, data);
+        ContainerListener list[] = new ContainerListener[0];
+        synchronized (listeners) {
+            list = (ContainerListener[]) listeners.toArray(list);
+        }
+        for (int i = 0; i < list.length; i++)
+            ((ContainerListener) list[i]).containerEvent(event);
+
+    }
+    public void addListenerDef(ContainerListenerDef listenererDef) {
+        synchronized (listenerDefs) {
+        	listenerDefs.add(listenererDef);
+        }
+    }
+	public void start(){
+		fireContainerEvent("Container Started",this);
+	}
+    public boolean listenerStart() {
+    	System.out.println("Listener Start..........");
+        boolean ok = true;
+        synchronized (listeners) {
+            listeners.clear();
+            Iterator<ContainerListenerDef> defs = listenerDefs.iterator();
+            while (defs.hasNext()) {
+            	ContainerListenerDef def = defs.next();
+                ContainerListener listener = null;
+                try {
+                    // Identify the class loader we will be using
+                    String listenerClass = def.getListenerClass();
+                    ClassLoader classLoader = null;
+                    classLoader = this.getLoader();
+
+                    ClassLoader oldCtxClassLoader =
+                        Thread.currentThread().getContextClassLoader();
+
+                    // Instantiate a new instance of this filter and return it
+                    Class<?> clazz = classLoader.loadClass(listenerClass);
+                    listener = (ContainerListener) clazz.newInstance();
+
+                    addContainerListener(listener);
+                } catch (Throwable t) {
+                	t.printStackTrace();
+                    ok = false;
+                }
+            }
+        }
+
+        return (ok);
+
+    }
+
+BootStrap:
+        ContainerListenerDef listenerDef = new ContainerListenerDef();
+        listenerDef.setListenerName("TestListener");
+        listenerDef.setListenerClass("test.TestListener");
+        container.addListenerDef(listenerDef);
+        container.listenerStart();
+        
+        container.start();
+
+---------------------------------Day 23---------------------------------------
+继续将BootStrap变得专业点，让它只负责启动。
+把别的业务代码放到Context中。
+
+具体来说就是BootStrap中的这一段：
+        Logger logger = new FileLogger();
+        container.setLogger(logger);
+        
+        FilterDef filterDef = new FilterDef();
+        filterDef.setFilterName("TestFilter");
+        filterDef.setFilterClass("test.TestFilter");
+        container.addFilterDef(filterDef);
+        
+        FilterMap filterMap = new FilterMap();
+        filterMap.setFilterName("TestFilter");
+        filterMap.setURLPattern("/*");
+        container.addFilterMap(filterMap);
+        
+        container.filterStart();
+        
+        ContainerListenerDef listenerDef = new ContainerListenerDef();
+        listenerDef.setListenerName("TestListener");
+        listenerDef.setListenerClass("test.TestListener");
+        container.addListenerDef(listenerDef);
+        container.listenerStart();
+日志、filter、listener这额其实跟服务器启动没有关系，而是每个Context自己来负责的，移走。
+
+BootStrap变得很简单：
+    public static void main(String[] args) {
+        if (debug >= 1)
+            log(".... startup ....");
+        
+        HttpConnector connector = new HttpConnector();
+        StandardContext container = new StandardContext();
+        
+        connector.setContainer(container);
+        container.setConnector(connector);
+                
+        container.start();
+        connector.start();
+    }
+
+由于每个context负责各自的应用，所以要隔离，目录隔离，classloader要隔离，这些参数可以配置，
+由BootStrap传给Context。
+	context.setPath("/myApp");
+    context.setDocBase("myApp");
+    WebappClassLoader loader = new WebappClassLoader();
+    context.setLoader(loader);
+
+-----------------------------Day 24------------------------------------
+上面已经为多应用进行了一些准备，下面我们实现多应用。
+对用户的感觉，多应用仅仅只是目录上多了一个<context>，比如：
+http://localhost:8080/app1/servlet/test.TestServlet
+主机地址后面的app1就是context，这样可以有两个版本不一样的test.TestServlet
+http://localhost:8080/app2/servlet/test.TestServlet
+
+因此，不同的应用，目录分开，classloader分开。
+我们已经使用了一个WebappClassLoader:
+public class WebappClassLoader {
+	ClassLoader classLoader;
+	String path;
+	String docbase;
+	Container container;
+
+	  public synchronized void start() {
+	    System.out.println("Starting WebappLoader");
+	    try {
+			// create a URLClassLoader
+			URL[] urls = new URL[1];
+			URLStreamHandler streamHandler = null;
+			File classPath = new File(System.getProperty("minit.base"));
+			String repository = (new URL("file", null, classPath.getCanonicalPath() + File.separator)).toString() ;
+			repository = repository + docbase + File.separator;
+			urls[0] = new URL(null, repository, streamHandler);
+			classLoader = new URLClassLoader(urls);
+	    }
+	  }
+	}
+就是包装了一个URLClassLoader，由它来加载应用中的客户类。
+每一个WebappClassLoader都有一个docBase，如上面例子中的app1或者app2，也就是context的目录。
+而整个服务器的跟存放在System.getProperty("minit.base")中，这个property由BootStrap启动时指定：
+public static final String WEB_ROOT = System.getProperty("user.dir") + File.separator + "webroot";
+比如，如果Minit放在d:/minit目录下，则WEB_ROOT目录为d:/minit/webroot，
+而app1的webclassloader的docbase为app1, 则它加载的目录repository为d:/minit/webroot/app1/
+
+而客户输入的URL为：
+http://localhost:8080/app1/servlet/test.TestServlet
+我们要修改解析URL的程序，最后将uri解析为/servlet/test.TestServlet，修改前uri为/app1/servlet/test.TestServlet
+
+具体的重新修改，是HttpRequestImpl.parseRequestLine():
+
+	        //get context from uri
+	        int contextslash = uri.indexOf("/", 1);
+	        if (contextslash != -1) {
+		        this.docbase = uri.substring(1, contextslash);
+		        uri = uri.substring(contextslash);
+	        }
+
+------------------------------Day 25-------------------------------
+我们现在涉及到几个classloader，一个是Java提供的系统级的AppClassLoader，
+还有就是Minit的host全局的webappclassloader,以及每一个context应用级别的webappclassloader。
+我们也整理一下。
+先改个名字，由于我们现在的实现其实是一个包装，里面包含了一个真正的classloader，所以我们改名叫webappLoader。
+然后提供两个真正的ClassLoader，一个是CommonClassLoader，一个是WebappClassLoader，parent是CommonClassLoader。
+同时再提供一个CommonLoader，这两个实现同一个接口Loader:
+public interface Loader {
+	public Container getContainer();
+	public void setContainer(Container container);
+	public String getPath();
+	public void setPath(String path);
+	public String getDocbase();
+	public void setDocbase(String docbase);
+	  public ClassLoader getClassLoader();
+	  public String getInfo();
+	  public void addRepository(String repository);
+	  public String[] findRepositories();
+	  public void start();
+	  public void stop();
+}
+CommonLoader是Minit全局共同的，它从lib目录下加载类：
+	  public synchronized void start() {
+			// create a URLClassLoader
+			URL[] urls = new URL[1];
+			URLStreamHandler streamHandler = null;
+			File classPath = new File(System.getProperty("minit.home"));
+			String repository = (new URL("file", null, classPath.getCanonicalPath() + File.separator)).toString() ;
+			repository = repository + "lib" + File.separator;
+
+			urls[0] = new URL(null, repository, streamHandler);
+			classLoader = new CommonClassLoader(urls);
+	  }
+而webapploader是某个应用context的，它从应用的WEB-INF/classes下加载类：
+	  public synchronized void start() {
+	    try {
+			// create a URLClassLoader
+			URL[] urls = new URL[1];
+			URLStreamHandler streamHandler = null;
+			File classPath = new File(System.getProperty("minit.base"));
+			String repository = (new URL("file", null, classPath.getCanonicalPath() + File.separator)).toString() ;
+			if (docbase!=null && !docbase.equals("")) {
+				repository = repository + docbase + File.separator;
+			}
+			repository = repository + "WEB-INF"+File.separator+"classes" + File.separator;
+			urls[0] = new URL(null, repository, streamHandler);
+			classLoader = new WebappClassLoader(urls,parent);
+	    }
+	    catch (Exception e) {
+	      System.out.println(e.toString() );
+	    }
+	  }
+目录结构在BootStrap中定义：
+    public static final String MINIT_HOME = System.getProperty("user.dir");
+    public static final String WEB_ROOT = System.getProperty("user.dir") + File.separator + "webapps";
+
+        System.setProperty("minit.home", MINIT_HOME);
+        System.setProperty("minit.base", WEB_ROOT);
+
+根据上述定义，加入minit的安装目录是f:\minit，则目录结构为：
+f:\minit
+f:\minit\lib         
+f:\minit\webapps
+f:\mimit\webapps\app1
+f:\mimit\webapps\app2
+f:\mimit\webapps\app1\WEB-INF\classes
+
+f:\minit\lib         由CommonClassLoader加载
+f:\mimit\webapps\app1\WEB-INF\classes      由WebappClassLoader加载
+
+看看WebappClassLoader的实现：
+它仍然是URLClassLoader的子类，所以findClass()没有变化，简单地使用父类URLClassLoader的findClass().
+public class WebappClassLoader extends URLClassLoader {
+    protected boolean delegate = false;
+    private ClassLoader parent = null;
+    private ClassLoader system = null;
+
+    public WebappClassLoader(URL[] urls, ClassLoader parent) {
+        super(urls, parent);
+        this.parent = parent;
+        system = getSystemClassLoader();
+    }
+
+    public Class findClass(String name) throws ClassNotFoundException {
+        Class clazz = null;
+        clazz = super.findClass(name);
+        return (clazz);
+    }
+
+    public Class loadClass(String name) throws ClassNotFoundException {
+        return (loadClass(name, false));
+    }
+    public Class<?> loadClass(String name, boolean resolve)
+        throws ClassNotFoundException {
+        Class<?> clazz = null;
+
+        // (0.2) Try loading the class with the system class loader, to prevent
+        //       the webapp from overriding J2SE classes
+            clazz = system.loadClass(name);
+            if (clazz != null) {
+                return (clazz);
+            }
+
+        boolean delegateLoad = delegate;
+        // (1) Delegate to our parent if requested
+        if (delegateLoad) {
+            ClassLoader loader = parent;
+            if (loader == null)
+                loader = system;
+            clazz = loader.loadClass(name);
+            if (clazz != null) {
+                return (clazz);
+            }
+        }
+
+        // (2) Search local repositories
+            clazz = findClass(name);
+            if (clazz != null) {
+                return (clazz);
+            }
+
+        // (3) Delegate to parent unconditionally
+        if (!delegateLoad) {
+            ClassLoader loader = parent;
+            if (loader == null)
+                loader = system;
+            clazz = loader.loadClass(name);
+            if (clazz != null) {
+                return (clazz);
+            }
+        }
+
+        // This class was not found
+        throw new ClassNotFoundException(name);
+    }
+}
+构造方法记录了parent和system，这是两个classloader，parent是传进来的，对于每一个应用context，classloader
+为WebappClassLoader，parent就是CommonClassLoader，system是Java内置提供的AppClassLoader.
+
+变化比较大的是loadClass(),它按照下面的次序加载类：
+	它首先尝试用system class loader取加载某个类；
+	然后如果是delegate模式（Java类加载机制的标准模式），则parent取加载这个类；
+	之后再试着自己加载类；
+	最后如果不是delegate模式，再用parent加载，如果parent为空，则用system加载。
+
+我们看到，Tomcat打破了Java的标准类加载机制，这样先自己试着加载，不行再用parent。
+
+BootStrap启动：
+    public static void main(String[] args) {
+        System.setProperty("minit.home", MINIT_HOME);
+        System.setProperty("minit.base", WEB_ROOT);
+        
+        HttpConnector connector = new HttpConnector();
+        StandardHost container = new StandardHost();
+        
+        Loader loader = new CommonLoader();
+        container.setLoader(loader);
+        loader.start();
+
+        connector.setContainer(container);
+        container.setConnector(connector);
+                
+        container.start();
+        connector.start();
+    }
+我们现在加入了一个Host的概念，host代表了总容器，minit启动Connector和Host。
+Host的loader就是刚才我们定义的CommonLoader. 以后由request发invoke()的时候，都会从host开始了。
+
+这个Host其实也是一个容器，是Context之上的容器，我们假定一个minit就这么一个host容器，
+它里面可以包含多个context。其实以前也是这样的，只不过再BootStrap里面弄了多个context，
+现在把这一部分单独抽取成一个host：
+public class StandardHost extends ContainerBase{
+	HttpConnector connector = null;
+	Map<String,StandardContext> contextMap = new ConcurrentHashMap<>();//contextName - servletContext
+	private ArrayList<ContainerListenerDef> listenerDefs = new ArrayList<>();
+	private ArrayList<ContainerListener> listeners = new ArrayList<>();
+
+	public StandardHost(){
+        super();
+        pipeline.setBasic(new StandardHostValve());
+	}
+	public void invoke(Request request, Response response)
+			throws IOException, ServletException {
+		super.invoke(request, response);
+	}
+	public StandardContext getContext(String name){
+		StandardContext context = contextMap.get(name); 
+		if ( context == null) {
+			context = new StandardContext();
+	        context.setDocBase(name);
+	        context.setConnector(connector);
+	        Loader loader = new WebappLoader(name,this.loader.getClassLoader());
+	        context.setLoader(loader);
+	        loader.start();
+			
+			this.contextMap.put(name, context);
+		}
+		return context;
+	}
+
+	public void start(){
+		fireContainerEvent("Host Started",this);
+
+        Logger logger = new FileLogger();
+        setLogger(logger);
+                
+        ContainerListenerDef listenerDef = new ContainerListenerDef();
+        listenerDef.setListenerName("TestListener");
+        listenerDef.setListenerClass("test.TestListener");
+        addListenerDef(listenerDef);
+        listenerStart();
+	}
+}
+最重要的是getContext：
+	public StandardContext getContext(String name){
+		StandardContext context = contextMap.get(name); 
+		if ( context == null) {
+			context = new StandardContext();
+	        context.setDocBase(name);
+	        context.setConnector(connector);
+	        Loader loader = new WebappLoader(name,this.loader.getClassLoader());
+	        context.setLoader(loader);
+	        loader.start();
+	        context.start();
+			
+			this.contextMap.put(name, context);
+		}
+		return context;
+	}
+它内部有个map保存了当前在用的context，如果没有找到，则创建一个，指定它用一个对应的WebappLoader.
+对应的有一个Valve：
+public class StandardHostValve extends ValveBase{
+	public void invoke(Request request, Response response, ValveContext context) throws IOException, ServletException {
+		String docbase = ((HttpRequestImpl)request).getDocbase();
+		StandardHost host = (StandardHost)getContainer();
+		
+		StandardContext servletContext = host.getContext(docbase); 
+		servletContext.invoke(request, response);
+	}
+}
+调用这个hostvalve的时候，就会执行getContext,拿到context再做后续工作。
+
+-------------------------------Day 26---------------------------------------
+现在我们怎么知道一个host之前有哪些context的？是有访问的时候临时getContext的。其实可以在host启动时识别一下，预先装入context。
+还有，我们怎么知道有哪些servlet的？是简单地根据URL中/servlet/之后的我们就认为是一个servlet class名，我们也可以用一个名称，
+放在web.xml中注册。
+同样，host的一些启动配置可以放到server.xml中。
+
+我们先在StandardHost的start()中增加下面这一段：
+        //load all context under /webapps directory
+		File classPath = new File(System.getProperty("minit.base"));
+		String dirs[] = classPath.list();
+	    for (int i=0; i < dirs.length; i++) {
+	    	getContext(dirs[i]);
+	    }
+这样通过扫描webapps目录，启动了所有context.
+
+下面引入Dom4j来解析xml，
+<dependency>
+    <groupId>org.dom4j</groupId>
+    <artifactId>dom4j</artifactId>
+    <version>2.1.3</version>
+</dependency>
+
+每个应用的web.xml格式如下：
+<?xml version="1.0" encoding="UTF-8"?>
+<web-app version="3.0" 
+	xmlns="http://java.sun.com/xml/ns/javaee" 
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+	xsi:schemaLocation="http://java.sun.com/xml/ns/javaee 
+	http://java.sun.com/xml/ns/javaee/web-app_3_0.xsd">
+	
+	<filter>
+		<filter-name>testfilter</filter-name>
+		<filter-class>test.TestFilter</filter-class>
+	</filter>
+	<filter-mapping>
+		<filter-name>testfilter</filter-name>
+		<url-pattern>/*</url-pattern>
+	</filter-mapping>
+	<servlet>
+		<servlet-name>testservlet</servlet-name>
+		<servlet-class>test.TestServlet</servlet-class>
+		<load-on-startup>1</load-on-startup>
+	</servlet>
+	<listener>
+		<listener-class>test.TestListener</listener-class>
+	</listener>
+</web-app>
+整个server也有一个配置文件，格式如下：
+<?xml version="1.0" encoding="UTF-8"?>
+<Server>
+    <Connector port="8080" />
+    <Host name="localhost"  appBase="webapps">
+    </Host>
+</Server>
+
+BootStrap启动时读取server.xml的配置：
+	    public static final String MINIT_HOME = System.getProperty("user.dir");
+	    public static String WEB_ROOT =  System.getProperty("user.dir");
+	    public static int PORT = 8080;
+
+        String file = MINIT_HOME + File.separator +	"conf" + File.separator + "server.xml";
+        
+        SAXReader reader = new SAXReader();
+        Document document;
+			document = reader.read(file);
+			Element root = document.getRootElement();
+
+			Element connectorelement= root.element("Connector");
+			Attribute portattribute = connectorelement.attribute("port");
+			PORT = Integer.parseInt(portattribute.getText());
+			
+            Element hostelement = root.element("Host");
+			Attribute appbaseattribute = hostelement.attribute("appBase");
+			WEB_ROOT =  WEB_ROOT + File.separator + appbaseattribute.getText();
+		}
+主要是port和appBase
+
+每个Context在start()的时候加载web.xml里面的配置：
+	public void start(){
+        //scan web.xml
+        String file = System.getProperty("minit.base") + File.separator + 
+        		this.docbase + File.separator + "WEB-INF" + File.separator + "web.xml";
+        
+        SAXReader reader = new SAXReader();
+        Document document;
+		try {
+			document = reader.read(file);
+			Element root = document.getRootElement();
+
+			//listeners
+			List<Element> listeners = root.elements("listener");
+	        for (Element listener : listeners) {
+	            Element listenerclass = listener.element("listener-class");
+	            String listenerclassname = listenerclass.getText();
+	            System.out.println("listenerclassname: " + listenerclassname);
+
+	            //load listeners
+	            ContainerListenerDef listenerDef = new ContainerListenerDef();
+	            listenerDef.setListenerName(listenerclassname);
+	            listenerDef.setListenerClass(listenerclassname);
+	            addListenerDef(listenerDef);
+	        }
+            listenerStart();
+
+			//filters
+			List<Element> filters = root.elements("filter");
+	        for (Element filter : filters) {
+	            Element filetername = filter.element("filter-name");
+	            String fileternamestr = filetername.getText();
+	            Element fileterclass = filter.element("filter-class");
+	            String fileterclassstr = fileterclass.getText();
+	            System.out.println("filter " + fileternamestr + fileterclassstr);
+
+	            //load filters
+	            FilterDef filterDef = new FilterDef();
+	            filterDef.setFilterName(fileternamestr);
+	            filterDef.setFilterClass(fileterclassstr);
+	            addFilterDef(filterDef);
+	        }
+            
+			//filter mappings
+			List<Element> filtermaps = root.elements("filter-mapping");
+	        for (Element filtermap : filtermaps) {
+	            Element filetername = filtermap.element("filter-name");
+	            String fileternamestr = filetername.getText();
+	            Element urlpattern = filtermap.element("url-pattern");
+	            String urlpatternstr = urlpattern.getText();
+	            System.out.println("filter mapping " + fileternamestr + urlpatternstr);
+
+	            FilterMap filterMap = new FilterMap();
+	            filterMap.setFilterName(fileternamestr);
+	            filterMap.setURLPattern(urlpatternstr);
+	            addFilterMap(filterMap);
+	        }
+	        
+	        filterStart();
+
+	        //servlet
+			List<Element> servlets = root.elements("servlet");
+	        for (Element servlet : servlets) {
+	            Element servletname = servlet.element("servlet-name");
+	            String servletnamestr = servletname.getText();
+	            Element servletclass = servlet.element("servlet-class");
+	            String servletclassstr = servletclass.getText();
+	            Element loadonstartup = servlet.element("load-on-startup");
+	            String loadonstartupstr = null;
+	            if (loadonstartup != null) {
+	            	loadonstartupstr = loadonstartup.getText();
+	            }
+	            
+	            System.out.println("servlet " + servletnamestr + servletclassstr);
+
+	            this.servletClsMap.put(servletnamestr, servletclassstr);
+	            if (loadonstartupstr != null) {
+		            getWrapper(servletnamestr);
+	            }	            
+	        }
+	}
+
+有了servlet name和实际class的配置，用户现在在浏览器地址栏上这么输入：
+http://localhost:8080/app1/servlet/testservlet?name=yale
