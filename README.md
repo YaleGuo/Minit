@@ -1,5 +1,5 @@
 # Minit
-A mini Tomcat
+A mini Tomcat for learning
 
 support Http protocol;
 static resource;
